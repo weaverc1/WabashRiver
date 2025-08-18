@@ -103,7 +103,7 @@ MAX_RETRIES = 3
 
 # Directory structure.  All state and log files live under
 # ``BASE_DIR`` to allow for simple backups and management.
-BASE_DIR = os.path.expanduser("~/storm")
+BASE_DIR = os.path.expanduser("~/storm/transmitter")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
 LM_PATH = os.path.join(BASE_DIR, "last_modified.txt")
