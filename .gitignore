@@ -1,0 +1,14 @@
+# Log files - decide if you want to track these
+*.log
+
+# Data files - probably don't want these in Git
+*.csv
+
+# Python
+*.pyc
+__pycache__/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
