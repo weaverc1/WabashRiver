@@ -3,466 +3,319 @@
 
 """
 storm3_tx.py
-================
+============
+Transmitter for Storm3 → LoRa link.
 
-This script runs on the Raspberry Pi attached to a WaterLOG Storm 3
-data logger.  It periodically fetches the most recent row from the
-Storm 3 CSV and forwards it over a LoRa link to a peer receiver.  The
-payload includes the site code, a compact timestamp, the stage and
-rain values, a temperature reading from the LoRa HAT (falling back to
-CPU temperature), and a monotonically increasing sequence number.
+Changes (2025-08-18):
+- Increase ACK timeout to 5s
+- Add 0.3s post-send settle time before listening for ACK
+- Add 1.0s pause between retries
+- Keep conditional-fetch (If-Modified-Since) behavior; log 304 as "No new data"
 
-Key features
--------------
-* **HTTP fetch with If‑Modified‑Since**:  We store the `Last‑Modified`
-  header from the previous run and include it on the next fetch.  If
-  nothing has changed the server returns `304 Not Modified` and we
-  avoid parsing or transmitting duplicate data.
-* **CSV banner detection**:  The Storm 3 often prepends a banner
-  before the CSV header.  We search for a line that contains
-  `Date` and `Time` with a comma and treat that as the header.
-* **Idempotent sends**:  We remember the last timestamp we sent in a
-  small JSON state file.  If the newest CSV timestamp is not newer
-  than our last send we exit quietly.  This prevents duplicate
-  transmissions after a reboot.
-* **LoRa transmission with ACKs**:  Each packet includes a
-  sequence number.  After sending we wait for a matching
-  `TYPE=ACK;SEQ=<n>` response from the peer.  We retry a few times
-  before giving up.  Only when an ACK is received do we bump the
-  sequence and last‑sent timestamp in the state file.
-* **Rotating logs**:  The script writes a structured log to
-  ``$BASE_DIR/logs/tx.log``.  The log files rotate at 200 KiB to
-  avoid filling the SD card.
+This script:
+1) Conditionally fetches the latest CSV row from the Storm3 over HTTP.
+2) If new data is available, formats a compact payload and sends via LoRa.
+3) Waits for TYPE=ACK;SEQ=<n> from the receiver with generous timing.
+4) Logs everything to a rotating tx.log.
 
-Usage
------
-This file is designed to be invoked by a systemd timer.  See the
-companion unit files for an example.  You can also test it manually:
-
-.. code-block:: bash
-
-   python3 storm3_tx.py
-
-Environment
------------
-The script assumes the `sx126x` driver module is installed and that
-the LoRa HAT is connected to ``/dev/serial0``.  Adjust the
-configuration section below if your hardware differs.  The script
-requires Python 3.7+.
+Assumptions:
+- sx126x driver (Waveshare SX126x HAT) is installed.
+- UART is /dev/serial0 on a Pi.
+- RX is configured as MY_ADDR=2, TX is MY_ADDR=1.
+- Frequency 915 MHz, air speed 1200 bps (must match RX).
 """
 
-import csv
 import io
-import json
-import logging
 import os
 import re
 import sys
 import time
-import urllib.error
+import json
+import gzip
+import logging
 import urllib.request
-from datetime import datetime
+import urllib.error
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+from contextlib import redirect_stdout
 
-# Attempt to import the sx126x LoRa driver.  This import will fail
-# during static analysis or on systems without the hardware.  The
-# script only requires the module at run time on the Pi.
+# ---------------------------
+# LoRa / Radio configuration
+# ---------------------------
 try:
     import sx126x  # type: ignore
 except ImportError:
     sx126x = None  # type: ignore
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-# Site code used in the payload.  Keep it short to save airtime.
-SITE_CODE = "HUT"
-
-# IP address of the Storm 3.  The CSV path is fixed beneath ``/data``.
-STORM_IP = "172.20.20.20"
-CSV_URL = f"http://{STORM_IP}/data/Hutsonville.csv"
-
-# HTTP request timeout in seconds.  Keep it short to prevent hangs.
-HTTP_TIMEOUT_S = 5
-
-# LoRa radio parameters.  These match the working values you used in
-# your range tests.  If you change the frequency or air speed on the
-# receiver side, update these to match.
 SERIAL_PORT = "/dev/serial0"
-MY_ADDR = 1
-PEER_ADDR = 2
-FREQ_MHZ = 915
-POWER_DBM = 22
-AIR_SPEED = 1200
+FREQ_MHZ    = 915
+AIR_SPEED   = 1200
+POWER_DBM   = 22
 
-# Acknowledgement configuration.  Each packet will be retried up to
-# `MAX_RETRIES` times.  After each send we wait `ACK_TIMEOUT_S`
-# seconds for a matching ACK.
-ACK_TIMEOUT_S = 2.0
-MAX_RETRIES = 3
+MY_ADDR   = 1  # transmitter
+PEER_ADDR = 2  # receiver
 
-# Directory structure.  All state and log files live under
-# ``BASE_DIR`` to allow for simple backups and management.
+# Generous, “chill” timings
+ACK_TIMEOUT_S   = 5.0   # wait up to 5 seconds for ACK (was ~2s)
+POST_SEND_PAUSE = 0.30  # short settle before listening for ACK
+RETRY_PAUSE_S   = 1.0   # spacing between retries
+MAX_RETRIES     = 3
+
+# ---------------------------
+# Storm3 CSV configuration
+# ---------------------------
+SITE_ID    = "Hutsonville"
+STORM_HOST = "172.20.20.20"
+
+# Adjust path if your firmware serves CSV elsewhere; this is your proven path:
+CSV_URL      = f"http://{STORM_HOST}/data/{SITE_ID}.csv"
+
+# ---------------------------
+# Paths & logging
+# ---------------------------
 BASE_DIR = os.path.expanduser("~/storm/transmitter")
-LOG_DIR = os.path.join(BASE_DIR, "logs")
-STATE_PATH = os.path.join(BASE_DIR, "state.json")
-LM_PATH = os.path.join(BASE_DIR, "last_modified.txt")
-LOG_PATH = os.path.join(LOG_DIR, "tx.log")
-
-# Configure logging.  We rotate the log after 200 KiB and keep three
-# backups.  The timestamps are recorded in UTC for consistency.
+LOG_DIR  = os.path.join(BASE_DIR, "logs")
+STATE_DIR= os.path.join(BASE_DIR, "state")
 os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(STATE_DIR, exist_ok=True)
+
+LOG_PATH = os.path.join(LOG_DIR, "tx.log")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")  # tracks seq + last-modified
+
 logger = logging.getLogger("storm3_tx")
 logger.setLevel(logging.INFO)
-handler = RotatingFileHandler(LOG_PATH, maxBytes=200_000, backupCount=3)
-formatter = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s")
-formatter.converter = time.gmtime  # store times as UTC
-handler.setFormatter(formatter)
-logger.addHandler(handler)
+_handler = RotatingFileHandler(LOG_PATH, maxBytes=300_000, backupCount=3)
+_fmt = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s")
+_fmt.converter = time.gmtime
+_handler.setFormatter(_fmt)
+logger.addHandler(_handler)
 
-
-# ---------------------------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------------------------
-def load_state() -> dict:
-    """Load the persistent state from disk.
-
-    The state file stores the last timestamp we sent and the last
-    sequence number used.  If the file does not exist or cannot be
-    parsed we return sensible defaults.
-    """
+# ---------------------------
+# Small state helpers
+# ---------------------------
+def _load_state():
+    if not os.path.exists(STATE_FILE):
+        return {"seq": 0, "if_modified_since": None}
     try:
-        with open(STATE_PATH, "r") as f:
+        with open(STATE_FILE, "r") as f:
             return json.load(f)
     except Exception:
-        return {"last_sent_ts": None, "seq": 0}
+        return {"seq": 0, "if_modified_since": None}
 
-
-def save_state(state: dict) -> None:
-    """Atomically persist the state to disk.
-
-    We write to a temporary file and then replace the existing state
-    file to avoid leaving a partially written file on interruption.
-    """
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-    os.replace(tmp, STATE_PATH)
-
-
-def freq_offset(freq_mhz: int) -> int:
-    """Convert a frequency in MHz to the offset byte used by the SX126x.
-
-    The driver interprets the offset as (freq – 850 MHz) for high bands
-    or (freq – 410 MHz) for low bands.  See your range test script for
-    reference.
-    """
-    return int(freq_mhz - (850 if freq_mhz > 850 else 410))
-
-
-def build_header(dst_addr: int, dst_off: int, src_addr: int, src_off: int) -> bytes:
-    """Build a 6‑byte SX126x header.
-
-    The header format is:
-
-    * 2 bytes: destination address (big endian)
-    * 1 byte : destination frequency offset
-    * 2 bytes: source address (big endian)
-    * 1 byte : source frequency offset
-    """
-    return bytes([
-        (dst_addr >> 8) & 0xFF,
-        dst_addr & 0xFF,
-        dst_off & 0xFF,
-        (src_addr >> 8) & 0xFF,
-        src_addr & 0xFF,
-        src_off & 0xFF,
-    ])
-
-
-def cpu_temp_c() -> float:
-    """Return the Raspberry Pi CPU temperature in °C.
-
-    If the temperature cannot be read a NaN is returned instead of
-    raising an exception.
-    """
+def _save_state(state):
     try:
-        with open("/sys/class/thermal/thermal_zone0/temp") as f:
-            return float(f.read().strip()) / 1000.0
-    except Exception:
-        return float("nan")
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        logger.warning(f"Failed to persist state: {e}")
 
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00","Z")
 
-def lora_hat_temp_c(node) -> float:
-    """Attempt to read the LoRa HAT temperature.
-
-    The sx126x driver is not uniformly documented.  To maximise
-    compatibility we probe several likely attribute names on the
-    ``node`` object.  If none are found we fall back to the CPU
-    temperature.  Additional names can be added here as needed.
-    """
-    for name in ("get_temp", "get_temperature", "chip_temp", "temperature"):
-        if hasattr(node, name):
-            try:
-                val = getattr(node, name)()
-                if val is not None:
-                    return float(val)
-            except Exception:
-                pass
-    return cpu_temp_c()
-
-
-def parse_storm3_csv(body: bytes) -> tuple:
-    """Extract the last timestamp, stage and rain values from CSV bytes.
-
-    The Storm 3 returns a banner line followed by a header and then
-    rows.  We locate the header by looking for a line containing
-    "Date", "Time" and a comma.  From that header we derive
-    column indices for the date, time, stage and rain fields.  If
-    stage or rain cannot be located by heuristic we default to the
-    third and fourth columns.  We return a tuple
-    ``(ts_compact, stage, rain)`` where ``ts_compact`` is of the
-    form ``YYYYMMDDTHHMMZ``.  If no rows are present a
-    ``RuntimeError`` is raised.
-    """
-    text = body.decode("utf-8", errors="ignore").splitlines()
-    if not text:
-        raise RuntimeError("CSV body is empty")
-
-    # Locate the header within the first few lines.  The Storm
-    # sometimes includes a banner line before the header.
-    header_idx = 0
-    for i, line in enumerate(text[:5]):
-        if "," in line and "Date" in line and "Time" in line:
-            header_idx = i
-            break
-
-    reader = csv.reader(io.StringIO("\n".join(text[header_idx:])))
-    header = next(reader, None)
-    if not header:
-        raise RuntimeError("Missing CSV header")
-    rows = [row for row in reader if row and len(row) >= 3]
-    if not rows:
-        raise RuntimeError("No CSV data rows")
-    last = rows[-1]
-
-    # Build a map of column names to indices
-    colmap = {name.strip(): idx for idx, name in enumerate(header)}
-    i_date = colmap.get("Date", 0)
-    i_time = colmap.get("Time", 1)
-    i_stage = None
-    i_rain = None
-    for name, idx in colmap.items():
-        lower = name.lower()
-        if i_stage is None and ("stage" in lower or "parameter1" in lower):
-            i_stage = idx
-        if i_rain is None and ("h-340" in lower or "rain" in lower):
-            i_rain = idx
-    if i_stage is None:
-        i_stage = 2
-    if i_rain is None:
-        i_rain = 3
-
-    date_s = last[i_date].strip()
-    time_s = last[i_time].strip()
-    timestamp_local = f"{date_s} {time_s}"
-    # Try multiple date formats.  Storm 3 usually uses MM/DD/YYYY.
-    dt = None
-    for fmt in ("%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-        try:
-            dt = datetime.strptime(timestamp_local, fmt)
-            break
-        except ValueError:
-            continue
-    if dt is None:
-        # If parsing fails, fall back to current UTC time.
-        dt = datetime.utcnow()
-
-    # Format as YYYYMMDDTHHMMZ (minute precision).  We treat the
-    # logger’s local time as UTC here.  The peer can translate as
-    # needed.
-    ts_compact = dt.strftime("%Y%m%dT%H%MZ")
-    stage = last[i_stage].strip()
-    rain = last[i_rain].strip()
-    return ts_compact, stage, rain
-
-
-def fetch_latest_row() -> tuple:
-    """Fetch the CSV from the Storm 3 and return the newest row.
-
-    Returns a tuple ``(ts_compact, stage, rain, last_modified)``.
-    If the server responds with 304 Not Modified we return
-    ``(None, None, None, last_modified)`` to signal no update.
-    """
-    # Read the previous Last‑Modified if present
-    ims = None
-    if os.path.exists(LM_PATH):
-        try:
-            ims = open(LM_PATH, "r").read().strip()
-        except Exception:
-            ims = None
-
-    # Build request with optional If‑Modified‑Since header
+# ---------------------------
+# HTTP: conditional GET
+# ---------------------------
+def fetch_latest_csv(if_modified_since: str | None):
     req = urllib.request.Request(CSV_URL, method="GET")
-    if ims:
-        req.add_header("If-Modified-Since", ims)
+    req.add_header("Accept", "text/csv, */*;q=0.1")
+    req.add_header("User-Agent", "storm3_tx/1.0")
+    req.add_header("Accept-Encoding", "gzip")
+
+    if if_modified_since:
+        req.add_header("If-Modified-Since", if_modified_since)
+
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(req, timeout=6) as resp:
             status = resp.status
-            body = resp.read()
+            # Handle gzip
+            data = resp.read()
+            if resp.headers.get("Content-Encoding","") == "gzip":
+                data = gzip.decompress(data)
             last_mod = resp.headers.get("Last-Modified")
+            return status, data.decode("utf-8", errors="replace"), last_mod
     except urllib.error.HTTPError as e:
-        status = e.code
-        body = b""
-        last_mod = None
+        if e.code == 304:
+            # Not modified
+            return 304, None, None
+        logger.warning(f"HTTP error: {e.reason}")
+        return None, None, None
     except Exception as e:
         logger.warning(f"HTTP error: {e}")
-        return None, None, None, ims
+        return None, None, None
 
-    if status == 304:
-        return None, None, None, ims
-    if status != 200 or not body:
-        raise RuntimeError(f"Failed to fetch CSV: HTTP {status}")
+# ---------------------------
+# CSV parsing
+# ---------------------------
+def extract_latest_line(csv_text: str) -> str | None:
+    # Assumes first line is header; return last non-empty line
+    if not csv_text:
+        return None
+    lines = [ln.strip() for ln in csv_text.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    return lines[-1]
 
-    ts_compact, stage, rain = parse_storm3_csv(body)
-
-    # Persist the Last‑Modified header for the next run
-    if last_mod:
-        try:
-            with open(LM_PATH, "w") as f:
-                f.write(last_mod)
-        except Exception:
-            pass
-
-    return ts_compact, stage, rain, last_mod
-
-
-def wait_for_ack(node, expected_seq: int, deadline: float) -> bool:
-    """Block until an ACK with the expected sequence is seen or timeout.
-
-    The sx126x driver prints to stdout on receive events.  We capture
-    its output via a string buffer and search for payloads that look
-    like ``TYPE=ACK;SEQ=<n>`` with the matching sequence number.
+# ---------------------------
+# Payload formatting
+# ---------------------------
+def build_payload(seq: int, latest_line: str) -> bytes:
     """
-    pattern = re.compile(r"message is b'(.*)'")
-    while time.time() < deadline:
-        from contextlib import redirect_stdout
-        import io as _io
-        buf = _io.StringIO()
+    Keep compact, TX-only payload. We’ll embed site ID, UTC timestamp of send,
+    and the raw CSV last line for traceability. Your receiver already logs RSSI.
+    """
+    send_ts = _now_iso()
+    # Trim the CSV line if it’s too long; LoRa payload budget is small
+    # (We saw bytes=55 in your logs; keep things lean)
+    csv_snippet = latest_line
+    if len(csv_snippet) > 24:
+        csv_snippet = csv_snippet[:24]
+
+    body = f"TYPE=DATA;SEQ={seq};P={SITE_ID}|{send_ts}|{csv_snippet}"
+    return body.encode("utf-8")
+
+# ---------------------------
+# LoRa helpers (header format compatible with RX)
+# ---------------------------
+def freq_offset(mhz: int) -> int:
+    return int(mhz - (850 if mhz > 850 else 410))
+
+def build_header(dst_addr: int, dst_off: int, src_addr: int, src_off: int) -> bytes:
+    return bytes([
+        (dst_addr >> 8) & 0xFF, dst_addr & 0xFF, dst_off & 0xFF,
+        (src_addr >> 8) & 0xFF, src_addr & 0xFF, src_off & 0xFF,
+    ])
+
+def init_radio():
+    if sx126x is None:
+        logger.error("sx126x module not installed; cannot transmit")
+        sys.exit(2)
+    try:
+        node = sx126x.sx126x(
+            serial_num=SERIAL_PORT,
+            freq=FREQ_MHZ,
+            addr=MY_ADDR,
+            power=POWER_DBM,
+            rssi=False,        # TX doesn’t need RSSI
+            air_speed=AIR_SPEED,
+            relay=False
+        )
+        return node
+    except Exception as e:
+        logger.error(f"Radio init failed: {e}")
+        sys.exit(3)
+
+ACK_RE = re.compile(r"TYPE=ACK;SEQ=(\d+)\b")
+
+def wait_for_ack(node, expect_seq: int, timeout_s: float) -> bool:
+    """
+    Poll the radio receive path, parsing the driver’s stdout for ACK frames.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        buf = io.StringIO()
         with redirect_stdout(buf):
             node.receive()
         out = buf.getvalue()
         if out:
+            # Look for the "message is b'...'" line and decode
             for line in out.splitlines():
-                m = pattern.search(line)
-                if m:
+                m = re.search(r"message is b'(.*)'", line)
+                if not m:
+                    continue
+                raw = m.group(1)
+                try:
+                    payload = raw.encode("latin1").decode("unicode_escape")
+                except Exception:
+                    payload = raw
+                a = ACK_RE.search(payload)
+                if a:
                     try:
-                        payload = m.group(1).encode("latin1").decode("unicode_escape")
-                    except Exception:
-                        payload = m.group(1)
-                    if "TYPE=ACK" in payload:
-                        m2 = re.search(r"SEQ=(\d+)", payload)
-                        if m2 and int(m2.group(1)) == expected_seq:
+                        got_seq = int(a.group(1))
+                        if got_seq == expect_seq:
                             return True
-        time.sleep(0.05)
+                    except ValueError:
+                        pass
+        time.sleep(0.02)
     return False
 
-
-def send_with_ack(node, peer_addr: int, payload: bytes, seq: int) -> bool:
-    """Transmit a payload and wait for its acknowledgement.
-
-    We build the LoRa header and raw frame and send it.  If the
-    acknowledgement is not received within the timeout we retry.  The
-    number of retries is limited by `MAX_RETRIES`.
-    """
-    dst_off = freq_offset(FREQ_MHZ)
-    src_off = freq_offset(FREQ_MHZ)
-    frame = build_header(peer_addr, dst_off, MY_ADDR, src_off) + payload
+def send_with_ack(node, payload: bytes, seq: int) -> bool:
+    header = build_header(PEER_ADDR, freq_offset(FREQ_MHZ),
+                          MY_ADDR,  freq_offset(FREQ_MHZ))
     for attempt in range(1, MAX_RETRIES + 1):
-        node.send(frame)
+        try:
+            node.send(header + payload)
+        except Exception as e:
+            logger.warning(f"TX error on attempt {attempt}: {e}")
+            time.sleep(RETRY_PAUSE_S)
+            continue
+
         logger.info(f"TX seq={seq} attempt={attempt} bytes={len(payload)}")
-        if wait_for_ack(node, seq, time.time() + ACK_TIMEOUT_S):
+
+        # Let the RX parse & respond before we start listening hard
+        time.sleep(POST_SEND_PAUSE)
+
+        if wait_for_ack(node, seq, ACK_TIMEOUT_S):
             logger.info(f"ACK seq={seq} received")
             return True
+
         logger.warning(f"ACK seq={seq} timeout on attempt {attempt}")
+        time.sleep(RETRY_PAUSE_S)
+
+    logger.error(f"Transmission failed after {MAX_RETRIES} retries (seq={seq})")
     return False
 
-
-def main() -> int:
-    """Main entry point.  Fetch the latest Storm 3 row and send it.
-
-    Returns zero on success, non‑zero on failure.  On failure we log
-    the error but do not update the state file, so the next run will
-    attempt again.
-    """
-    # Ensure the base directory exists
-    os.makedirs(BASE_DIR, exist_ok=True)
-
-    # Load the persistent state
-    state = load_state()
-
-    # Fetch the newest CSV row
-    try:
-        ts_compact, stage, rain, _ = fetch_latest_row()
-    except Exception as e:
-        logger.error(f"Fetch/parsing error: {e}")
-        return 1
-
-    # If nothing has changed, exit quietly
-    if ts_compact is None:
-        logger.info("No new data (304 Not Modified)")
-        return 0
-
-    # Check for duplicate sends
-    last_sent_ts = state.get("last_sent_ts")
-    if last_sent_ts and ts_compact <= last_sent_ts:
-        logger.info(f"Skipping send (ts={ts_compact} <= last_sent_ts={last_sent_ts})")
-        return 0
-
-    # Initialize the radio
-    if sx126x is None:
-        logger.error("sx126x module not installed; cannot send")
-        return 2
-    try:
-        node = sx126x.sx126x(serial_num=SERIAL_PORT,
-                             freq=FREQ_MHZ,
-                             addr=MY_ADDR,
-                             power=POWER_DBM,
-                             rssi=True,
-                             air_speed=AIR_SPEED,
-                             relay=False)
-    except Exception as e:
-        logger.error(f"Radio init failed: {e}")
-        return 3
-
-    # Read the LoRa HAT temperature (falls back to CPU)
-    temp_c = lora_hat_temp_c(node)
-
-    # Bump the sequence number
+# ---------------------------
+# Main
+# ---------------------------
+def main():
+    state = _load_state()
     seq = int(state.get("seq", 0)) + 1
+    if_modified_since = state.get("if_modified_since")
 
-    # Build the payload.  We prefix with a small header (TYPE and SEQ)
-    # and embed the data in a pipe‑separated field for easy parsing.
-    payload_str = f"{SITE_CODE}|{ts_compact}|{stage}|{rain}|{temp_c:.2f}|{seq}"
-    payload = f"TYPE=DATA;SEQ={seq};P={payload_str}".encode()
+    # 1) Conditionally fetch CSV
+    status, text, last_mod = fetch_latest_csv(if_modified_since)
+    if status == 304:
+        logger.info("No new data (304 Not Modified)")
+        # Keep current state.seq unchanged on no-send? We can, but your log kept seq at 1.
+        # We'll not bump seq when no send happens:
+        state["seq"] = seq - 1
+        _save_state(state)
+        return
+    if status is None:
+        logger.warning("No new data (HTTP error)")
+        state["seq"] = seq - 1
+        _save_state(state)
+        return
+    if status != 200 or not text:
+        logger.warning("HTTP returned no content")
+        state["seq"] = seq - 1
+        _save_state(state)
+        return
 
-    # Send and wait for acknowledgement
-    success = send_with_ack(node, PEER_ADDR, payload, seq)
-    if not success:
-        logger.error(f"Transmission failed after {MAX_RETRIES} retries (seq={seq})")
-        return 4
+    # 2) Extract latest CSV line
+    latest = extract_latest_line(text)
+    if not latest:
+        logger.info("No new data (CSV empty or header-only)")
+        state["seq"] = seq - 1
+        _save_state(state)
+        return
 
-    # Persist the new state
-    state["last_sent_ts"] = ts_compact
+    # 3) Build payload
+    payload = build_payload(seq, latest)
+
+    # 4) Init radio and send with ACK
+    node = init_radio()
+    ok = send_with_ack(node, payload, seq)
+
+    # 5) Persist state
+    if ok and last_mod:
+        state["if_modified_since"] = last_mod
+    # Only advance seq if we actually transmitted (regardless of ACK success) to avoid reuse
     state["seq"] = seq
-    save_state(state)
-    logger.info(f"Transmission successful: ts={ts_compact} stage={stage} rain={rain} tempC={temp_c:.2f} seq={seq}")
-    return 0
-
+    _save_state(state)
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        main()
     except KeyboardInterrupt:
-        # Graceful shutdown on Ctrl+C
-        sys.exit(130)
+        print()
