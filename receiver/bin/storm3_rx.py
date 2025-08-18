@@ -45,7 +45,7 @@ FREQ_MHZ = 915                  # Must match the transmitter
 POWER_DBM = 22                  # Irrelevant for receiving but required by driver
 AIR_SPEED = 1200                # Must match the transmitter
 
-BASE_DIR = os.path.expanduser("~/storm")
+BASE_DIR = os.path.expanduser("~/storm/receiver")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 LOG_PATH = os.path.join(LOG_DIR, "rx.log")
 CSV_PATH = os.path.join(LOG_DIR, "rx.csv")
