@@ -5,20 +5,11 @@
 storm3_rx.py
 =================
 
-This companion script listens for LoRa packets sent by ``storm3_tx.py``
-and records them to a log. It prints each received payload on the console
-along with the packet RSSI and the current noise RSSI, and it writes a CSV
-log with ISO timestamps for later analysis.
+LoRa receiver for Storm3 → Pi with ACK support and robust driver error handling.
 
-NEW: The receiver now sends acknowledgements. When a ``TYPE=DATA`` payload
-with ``SEQ=<n>`` is received, the script immediately replies with
-``TYPE=ACK;SEQ=<n>`` using the same 6‑byte header (dst/src addr + freq
-offset) expected by the transmitter.
-
-The script relies on the same ``sx126x`` driver as the transmitter. It
-assumes the LoRa HAT is connected to ``/dev/serial0`` and that the frequency,
-address and air speed match those of the transmitter. If your settings differ,
-adjust the configuration section below.
+- Logs payloads + RSSI to rx.log and rx.csv (rotating).
+- Immediately ACKs TYPE=DATA packets with TYPE=ACK;SEQ=<n>.
+- Wraps sx126x.receive() in a try/except to survive occasional driver IndexErrors.
 """
 
 import io
@@ -140,61 +131,78 @@ def listen() -> None:
     while True:
         # Capture the driver’s stdout to parse the receive event
         buf = io.StringIO()
-        with redirect_stdout(buf):
-            node.receive()
+        try:
+            with redirect_stdout(buf):
+                # Defensive wrapper: some driver versions raise IndexError on noise/short buffers
+                node.receive()
+        except Exception as e:
+            logger.warning(f"Driver receive() error: {e}")
+            time.sleep(0.10)
+            continue
+
         out = buf.getvalue()
+        if not out:
+            time.sleep(0.05)
+            continue
 
-        if out:
-            # Initialise fields for this packet
-            payload_raw = None
-            packet_rssi = None
-            noise_rssi  = None
+        # Initialise fields for this packet
+        payload_raw = None
+        packet_rssi = None
+        noise_rssi  = None
 
-            for line in out.splitlines():
-                # Extract the payload as a bytes literal string
-                m_msg = pattern_msg.search(line)
-                if m_msg:
-                    payload_raw = m_msg.group(1)
+        for line in out.splitlines():
+            # Extract the payload as a bytes literal string
+            m_msg = pattern_msg.search(line)
+            if m_msg:
+                payload_raw = m_msg.group(1)
 
-                m_prssi = pattern_prssi.search(line)
-                if m_prssi:
-                    try:
-                        packet_rssi = int(m_prssi.group(1))
-                    except ValueError:
-                        packet_rssi = None
-
-                m_nrssi = pattern_nrssi.search(line)
-                if m_nrssi:
-                    try:
-                        noise_rssi = int(m_nrssi.group(1))
-                    except ValueError:
-                        noise_rssi = None
-
-            if payload_raw is not None:
-                # Decode any escape sequences in the raw payload
+            m_prssi = pattern_prssi.search(line)
+            if m_prssi:
                 try:
-                    payload = payload_raw.encode("latin1").decode("unicode_escape")
-                except Exception:
-                    payload = payload_raw
+                    packet_rssi = int(m_prssi.group(1))
+                except ValueError:
+                    packet_rssi = None
 
-                # If it's a DATA packet with SEQ=n, send an ACK back immediately
-                if "TYPE=DATA" in payload:
-                    m_seq = pattern_seq.search(payload)
-                    if m_seq:
-                        try:
-                            seq = int(m_seq.group(1))
-                            send_ack(node, seq)
-                        except ValueError:
-                            logger.warning("RX: bad SEQ in payload, not ACKing")
+            m_nrssi = pattern_nrssi.search(line)
+            if m_nrssi:
+                try:
+                    noise_rssi = int(m_nrssi.group(1))
+                except ValueError:
+                    noise_rssi = None
 
-                # Log to CSV and file
-                ts = now_iso()
-                with open(CSV_PATH, "a") as f:
-                    f.write(f"{ts},{packet_rssi},{noise_rssi},{payload}\n")
-                logger.info(f"RX payload={payload} packet_rssi={packet_rssi} noise_rssi={noise_rssi}")
+        if payload_raw is None:
+            # Nothing parsable this cycle (driver might have printed only meta lines)
+            time.sleep(0.02)
+            continue
 
-                # Print to console for interactive runs
-                print(f"[{ts}] payload={payload} packet_rssi={packet_rssi} noise_rssi={noise_rssi}")
+        # Decode any escape sequences in the raw payload
+        try:
+            payload = payload_raw.encode("latin1").decode("unicode_escape")
+        except Exception:
+            payload = payload_raw
+
+        # If it's a DATA packet with SEQ=n, send an ACK back immediately
+        if "TYPE=DATA" in payload:
+            m_seq = pattern_seq.search(payload)
+            if m_seq:
+                try:
+                    seq = int(m_seq.group(1))
+                    send_ack(node, seq)
+                except ValueError:
+                    logger.warning("RX: bad SEQ in payload, not ACKing")
+
+        # Log to CSV and file
+        ts = now_iso()
+        try:
+            with open(CSV_PATH, "a") as f:
+                f.write(f"{ts},{packet_rssi},{noise_rssi},{payload}\n")
+        except Exception as e:
+            logger.warning(f"Failed to append CSV: {e}")
+
+        logger.info(f"RX payload={payload} packet_rssi={packet_rssi} noise_rssi={noise_rssi}")
+
+        # Print to console for interactive runs
+        print(f"[{ts}] payload={payload} packet_rssi={packet_rssi} noise_rssi={noise_rssi}")
 
         # Sleep briefly to avoid a tight loop when idle
         time.sleep(0.05)
