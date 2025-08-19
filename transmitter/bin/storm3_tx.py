@@ -6,23 +6,18 @@ storm3_tx.py
 ============
 Transmitter for Storm3 → LoRa link.
 
-Changes (2025-08-18):
-- Increase ACK timeout to 5s
-- Add 0.3s post-send settle time before listening for ACK
-- Add 1.0s pause between retries
-- Keep conditional-fetch (If-Modified-Since) behavior; log 304 as "No new data"
+2025‑08‑19 changes:
+- Remove "P=Hutsonville|<utc>|" preamble from DATA frames
+- Parse CSV and send only Date,Time,Riverstage,H-340
+- Append local board temp (°C) from /sys/class/thermal/thermal_zone0/temp as TC=<degC>
+- Keep conditional GET (If-Modified-Since) + gzip handling
+- Generous ACK timing (timeout 5s, 0.3s settle, 1.0s retry pause)
 
-This script:
-1) Conditionally fetches the latest CSV row from the Storm3 over HTTP.
-2) If new data is available, formats a compact payload and sends via LoRa.
-3) Waits for TYPE=ACK;SEQ=<n> from the receiver with generous timing.
-4) Logs everything to a rotating tx.log.
+Packet format (ASCII):
+  TYPE=DATA;SEQ=<n>;D=<MM/DD/YYYY>,<HH:MM:SS>,<riverstage>,<h340>;TC=<celsius>
 
-Assumptions:
-- sx126x driver (Waveshare SX126x HAT) is installed.
-- UART is /dev/serial0 on a Pi.
-- RX is configured as MY_ADDR=2, TX is MY_ADDR=1.
-- Frequency 915 MHz, air speed 1200 bps (must match RX).
+Example:
+  TYPE=DATA;SEQ=13;D=08/19/2025,17:15:00,19.548,0.02;TC=51.6
 """
 
 import io
@@ -38,6 +33,7 @@ import urllib.error
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from contextlib import redirect_stdout
+from typing import Optional, Tuple
 
 # ---------------------------
 # LoRa / Radio configuration
@@ -55,10 +51,9 @@ POWER_DBM   = 22
 MY_ADDR   = 1  # transmitter
 PEER_ADDR = 2  # receiver
 
-# Generous, “chill” timings
-ACK_TIMEOUT_S   = 5.0   # wait up to 5 seconds for ACK (was ~2s)
-POST_SEND_PAUSE = 0.30  # short settle before listening for ACK
-RETRY_PAUSE_S   = 1.0   # spacing between retries
+ACK_TIMEOUT_S   = 5.0
+POST_SEND_PAUSE = 0.30
+RETRY_PAUSE_S   = 1.0
 MAX_RETRIES     = 3
 
 # ---------------------------
@@ -66,20 +61,18 @@ MAX_RETRIES     = 3
 # ---------------------------
 SITE_ID    = "Hutsonville"
 STORM_HOST = "172.20.20.20"
-
-# Adjust path if your firmware serves CSV elsewhere; this is your proven path:
-CSV_URL      = f"http://{STORM_HOST}/data/{SITE_ID}.csv"
+CSV_URL    = f"http://{STORM_HOST}/data/{SITE_ID}.csv"  # adjust if your firmware differs
 
 # ---------------------------
 # Paths & logging
 # ---------------------------
-BASE_DIR = os.path.expanduser("~/storm/transmitter")
-LOG_DIR  = os.path.join(BASE_DIR, "logs")
-STATE_DIR= os.path.join(BASE_DIR, "state")
+BASE_DIR  = os.path.expanduser("~/storm/transmitter")
+LOG_DIR   = os.path.join(BASE_DIR, "logs")
+STATE_DIR = os.path.join(BASE_DIR, "state")
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(STATE_DIR, exist_ok=True)
 
-LOG_PATH = os.path.join(LOG_DIR, "tx.log")
+LOG_PATH   = os.path.join(LOG_DIR, "tx.log")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")  # tracks seq + last-modified
 
 logger = logging.getLogger("storm3_tx")
@@ -109,33 +102,44 @@ def _save_state(state):
     except Exception as e:
         logger.warning(f"Failed to persist state: {e}")
 
-def _now_iso():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00","Z")
+# ---------------------------
+# Board/HAT temperature (°C)
+# ---------------------------
+def get_hat_temp_c() -> Optional[float]:
+    """
+    Uses the same approach shown in the vendor example: read the kernel thermal zone.
+    On Raspberry Pi this returns CPU/board temp which is a good proxy for the HAT temp.
+    """
+    path = "/sys/class/thermal/thermal_zone0/temp"
+    try:
+        with open(path, "r") as f:
+            milli = int(f.read().strip())
+        return milli / 1000.0
+    except Exception as e:
+        logger.warning(f"Could not read board temperature: {e}")
+        return None
 
 # ---------------------------
 # HTTP: conditional GET
 # ---------------------------
-def fetch_latest_csv(if_modified_since: str | None):
+def fetch_latest_csv(if_modified_since: Optional[str]) -> Tuple[Optional[int], Optional[str], Optional[str]]:
     req = urllib.request.Request(CSV_URL, method="GET")
     req.add_header("Accept", "text/csv, */*;q=0.1")
-    req.add_header("User-Agent", "storm3_tx/1.0")
+    req.add_header("User-Agent", "storm3_tx/1.1")
     req.add_header("Accept-Encoding", "gzip")
-
     if if_modified_since:
         req.add_header("If-Modified-Since", if_modified_since)
 
     try:
         with urllib.request.urlopen(req, timeout=6) as resp:
             status = resp.status
-            # Handle gzip
             data = resp.read()
-            if resp.headers.get("Content-Encoding","") == "gzip":
+            if resp.headers.get("Content-Encoding", "") == "gzip":
                 data = gzip.decompress(data)
             last_mod = resp.headers.get("Last-Modified")
             return status, data.decode("utf-8", errors="replace"), last_mod
     except urllib.error.HTTPError as e:
         if e.code == 304:
-            # Not modified
             return 304, None, None
         logger.warning(f"HTTP error: {e.reason}")
         return None, None, None
@@ -146,31 +150,45 @@ def fetch_latest_csv(if_modified_since: str | None):
 # ---------------------------
 # CSV parsing
 # ---------------------------
-def extract_latest_line(csv_text: str) -> str | None:
-    # Assumes first line is header; return last non-empty line
+def extract_latest_row(csv_text: str) -> Optional[Tuple[str, str, str, str]]:
+    """
+    Returns (date, time, riverstage, h340) from the last non-empty data line.
+    Assumes header like:
+      Date,Time,Riverstage...,H-340
+    """
     if not csv_text:
         return None
+
     lines = [ln.strip() for ln in csv_text.splitlines() if ln.strip()]
     if len(lines) < 2:
         return None
-    return lines[-1]
+
+    # find the last line that looks like data (has at least 4 comma-separated fields)
+    for ln in reversed(lines):
+        parts = [p.strip() for p in ln.split(",")]
+        if len(parts) >= 4 and parts[0] and parts[1]:
+            date, tm, river, h340 = parts[0], parts[1], parts[2], parts[3]
+            return date, tm, river, h340
+    return None
 
 # ---------------------------
 # Payload formatting
 # ---------------------------
-def build_payload(seq: int, latest_line: str) -> bytes:
+def build_payload(seq: int, row: Tuple[str, str, str, str]) -> bytes:
     """
-    Keep compact, TX-only payload. We’ll embed site ID, UTC timestamp of send,
-    and the raw CSV last line for traceability. Your receiver already logs RSSI.
-    """
-    send_ts = _now_iso()
-    # Trim the CSV line if it’s too long; LoRa payload budget is small
-    # (We saw bytes=55 in your logs; keep things lean)
-    csv_snippet = latest_line
-    if len(csv_snippet) > 24:
-        csv_snippet = csv_snippet[:24]
+    Final on-air frame (ASCII):
+      TYPE=DATA;SEQ=<n>;D=<date>,<time>,<river>,<h340>;TC=<celsius>
 
-    body = f"TYPE=DATA;SEQ={seq};P={SITE_ID}|{send_ts}|{csv_snippet}"
+    Notes:
+      - We keep it compact to fit the LoRa payload budget.
+      - Temperature rounded to one decimal if available; omit TC= if not.
+    """
+    date, tm, river, h340 = row
+    tc = get_hat_temp_c()
+    if tc is None:
+        body = f"TYPE=DATA;SEQ={seq};D={date},{tm},{river},{h340}"
+    else:
+        body = f"TYPE=DATA;SEQ={seq};D={date},{tm},{river},{h340};TC={tc:.1f}"
     return body.encode("utf-8")
 
 # ---------------------------
@@ -217,7 +235,6 @@ def wait_for_ack(node, expect_seq: int, timeout_s: float) -> bool:
             node.receive()
         out = buf.getvalue()
         if out:
-            # Look for the "message is b'...'" line and decode
             for line in out.splitlines():
                 m = re.search(r"message is b'(.*)'", line)
                 if not m:
@@ -250,8 +267,6 @@ def send_with_ack(node, payload: bytes, seq: int) -> bool:
             continue
 
         logger.info(f"TX seq={seq} attempt={attempt} bytes={len(payload)}")
-
-        # Let the RX parse & respond before we start listening hard
         time.sleep(POST_SEND_PAUSE)
 
         if wait_for_ack(node, seq, ACK_TIMEOUT_S):
@@ -276,8 +291,6 @@ def main():
     status, text, last_mod = fetch_latest_csv(if_modified_since)
     if status == 304:
         logger.info("No new data (304 Not Modified)")
-        # Keep current state.seq unchanged on no-send? We can, but your log kept seq at 1.
-        # We'll not bump seq when no send happens:
         state["seq"] = seq - 1
         _save_state(state)
         return
@@ -292,16 +305,19 @@ def main():
         _save_state(state)
         return
 
-    # 2) Extract latest CSV line
-    latest = extract_latest_line(text)
-    if not latest:
+    # 2) Extract latest CSV row
+    row = extract_latest_row(text)
+    if not row:
         logger.info("No new data (CSV empty or header-only)")
         state["seq"] = seq - 1
         _save_state(state)
         return
 
-    # 3) Build payload
-    payload = build_payload(seq, latest)
+    date, tm, river, h340 = row
+    logger.info(f"Latest CSV row D={date},{tm},{river},{h340}")
+
+    # 3) Build payload (compact, no site/time preamble)
+    payload = build_payload(seq, row)
 
     # 4) Init radio and send with ACK
     node = init_radio()
@@ -310,8 +326,7 @@ def main():
     # 5) Persist state
     if ok and last_mod:
         state["if_modified_since"] = last_mod
-    # Only advance seq if we actually transmitted (regardless of ACK success) to avoid reuse
-    state["seq"] = seq
+    state["seq"] = seq  # advance seq after any attempted send
     _save_state(state)
 
 if __name__ == "__main__":
