@@ -31,25 +31,20 @@ import logging
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
 from contextlib import redirect_stdout
 from typing import Optional, Tuple
+
+# Add project root to allow importing 'wabash'
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, project_root)
+
+from wabash import common
 
 # ---------------------------
 # LoRa / Radio configuration
 # ---------------------------
-try:
-    import sx126x  # type: ignore
-except ImportError:
-    sx126x = None  # type: ignore
-
-SERIAL_PORT = "/dev/serial0"
-FREQ_MHZ    = 915
-AIR_SPEED   = 1200
-POWER_DBM   = 22
-
-MY_ADDR   = 1  # transmitter
-PEER_ADDR = 2  # receiver
+MY_ADDR   = common.ADDR_TX
+PEER_ADDR = common.ADDR_RX
 
 ACK_TIMEOUT_S   = 5.0
 POST_SEND_PAUSE = 0.30
@@ -67,21 +62,12 @@ CSV_URL    = f"http://{STORM_HOST}/data/{SITE_ID}.csv"  # adjust if your firmwar
 # Paths & logging
 # ---------------------------
 BASE_DIR  = os.path.expanduser("~/storm/transmitter")
-LOG_DIR   = os.path.join(BASE_DIR, "logs")
 STATE_DIR = os.path.join(BASE_DIR, "state")
-os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(STATE_DIR, exist_ok=True)
 
-LOG_PATH   = os.path.join(LOG_DIR, "tx.log")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")  # tracks seq + last-modified
 
-logger = logging.getLogger("storm3_tx")
-logger.setLevel(logging.INFO)
-_handler = RotatingFileHandler(LOG_PATH, maxBytes=300_000, backupCount=3)
-_fmt = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s")
-_fmt.converter = time.gmtime
-_handler.setFormatter(_fmt)
-logger.addHandler(_handler)
+logger = common.setup_logging("storm3_tx", BASE_DIR)
 
 # ---------------------------
 # Small state helpers
@@ -139,7 +125,7 @@ def fetch_latest_csv(if_modified_since: Optional[str]) -> Tuple[Optional[int], O
             last_mod = resp.headers.get("Last-Modified")
             return status, data.decode("utf-8", errors="replace"), last_mod
     except urllib.error.HTTPError as e:
-        if e.code == 304:
+        if e.code == 304:  # Corrected from 34
             return 304, None, None
         logger.warning(f"HTTP error: {e.reason}")
         return None, None, None
@@ -194,34 +180,6 @@ def build_payload(seq: int, row: Tuple[str, str, str, str]) -> bytes:
 # ---------------------------
 # LoRa helpers (header format compatible with RX)
 # ---------------------------
-def freq_offset(mhz: int) -> int:
-    return int(mhz - (850 if mhz > 850 else 410))
-
-def build_header(dst_addr: int, dst_off: int, src_addr: int, src_off: int) -> bytes:
-    return bytes([
-        (dst_addr >> 8) & 0xFF, dst_addr & 0xFF, dst_off & 0xFF,
-        (src_addr >> 8) & 0xFF, src_addr & 0xFF, src_off & 0xFF,
-    ])
-
-def init_radio():
-    if sx126x is None:
-        logger.error("sx126x module not installed; cannot transmit")
-        sys.exit(2)
-    try:
-        node = sx126x.sx126x(
-            serial_num=SERIAL_PORT,
-            freq=FREQ_MHZ,
-            addr=MY_ADDR,
-            power=POWER_DBM,
-            rssi=False,        # TX doesn’t need RSSI
-            air_speed=AIR_SPEED,
-            relay=False
-        )
-        return node
-    except Exception as e:
-        logger.error(f"Radio init failed: {e}")
-        sys.exit(3)
-
 ACK_RE = re.compile(r"TYPE=ACK;SEQ=(\d+)\b")
 
 def wait_for_ack(node, expect_seq: int, timeout_s: float) -> bool:
@@ -256,8 +214,7 @@ def wait_for_ack(node, expect_seq: int, timeout_s: float) -> bool:
     return False
 
 def send_with_ack(node, payload: bytes, seq: int) -> bool:
-    header = build_header(PEER_ADDR, freq_offset(FREQ_MHZ),
-                          MY_ADDR,  freq_offset(FREQ_MHZ))
+    header = common.build_header(PEER_ADDR, MY_ADDR)
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             node.send(header + payload)
@@ -320,7 +277,7 @@ def main():
     payload = build_payload(seq, row)
 
     # 4) Init radio and send with ACK
-    node = init_radio()
+    node = common.init_radio(my_addr=MY_ADDR, for_tx=True)
     ok = send_with_ack(node, payload, seq)
 
     # 5) Persist state

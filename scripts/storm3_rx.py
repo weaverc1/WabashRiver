@@ -19,40 +19,26 @@ import re
 import sys
 import time
 from datetime import datetime
-from logging.handlers import RotatingFileHandler
 from contextlib import redirect_stdout
 
-try:
-    import sx126x  # type: ignore
-except ImportError:
-    sx126x = None  # type: ignore
+# Add project root to allow importing 'wabash'
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, project_root)
+
+from wabash import common
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SERIAL_PORT = "/dev/serial0"   # UART for the LoRa HAT
-MY_ADDR = 2                     # This node’s address (receiver)
-PEER_ADDR = 1                   # Transmitter’s address (for ACKs)
-FREQ_MHZ = 915                  # Must match the transmitter
-POWER_DBM = 22                  # Required by driver (not used for RX)
-AIR_SPEED = 1200                # Must match the transmitter
+MY_ADDR   = common.ADDR_RX
+PEER_ADDR = common.ADDR_TX
 
 BASE_DIR = os.path.expanduser("~/storm/receiver")
-LOG_DIR = os.path.join(BASE_DIR, "logs")
-LOG_PATH = os.path.join(LOG_DIR, "rx.log")
+LOG_DIR  = os.path.join(BASE_DIR, "logs")
 CSV_PATH = os.path.join(LOG_DIR, "rx.csv")
 
-# Ensure log directory exists
-os.makedirs(LOG_DIR, exist_ok=True)
-
-# Set up logging with rotation to avoid filling the disk
-logger = logging.getLogger("storm3_rx")
-logger.setLevel(logging.INFO)
-handler = RotatingFileHandler(LOG_PATH, maxBytes=200_000, backupCount=3)
-formatter = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s")
-formatter.converter = time.gmtime
-handler.setFormatter(formatter)
-logger.addHandler(handler)
+# Set up logging with rotation
+logger = common.setup_logging("storm3_rx", BASE_DIR, max_bytes=200_000)
 
 # If the CSV log does not exist, write the header
 if not os.path.exists(CSV_PATH):
@@ -63,38 +49,15 @@ if not os.path.exists(CSV_PATH):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def ensure_driver() -> None:
-    """Abort if the sx126x driver is missing."""
-    if sx126x is None:
-        logger.error("sx126x module not installed; cannot receive")
-        sys.exit(2)
-
-
 def now_iso() -> str:
-    """Return the current time in ISO‑8601 format with UTC suffix."""
+    """Return the current time in ISO-8601 format with UTC suffix."""
     return datetime.utcnow().isoformat() + "Z"
-
-
-def freq_offset(freq_mhz: int) -> int:
-    """Convert frequency to the offset byte used by the SX126x header."""
-    return int(freq_mhz - (850 if freq_mhz > 850 else 410))
-
-
-def build_header(dst_addr: int, dst_off: int, src_addr: int, src_off: int) -> bytes:
-    """Build the 6‑byte header: dst(2) dst_off(1) src(2) src_off(1)."""
-    return bytes([
-        (dst_addr >> 8) & 0xFF, dst_addr & 0xFF, dst_off & 0xFF,
-        (src_addr >> 8) & 0xFF, src_addr & 0xFF, src_off & 0xFF,
-    ])
 
 
 def send_ack(node, seq: int) -> None:
     """Send TYPE=ACK;SEQ=<n> back to the transmitter."""
     ack_payload = f"TYPE=ACK;SEQ={seq}".encode()
-    hdr = build_header(
-        PEER_ADDR, freq_offset(FREQ_MHZ),
-        MY_ADDR,   freq_offset(FREQ_MHZ),
-    )
+    hdr = common.build_header(PEER_ADDR, MY_ADDR)
     try:
         node.send(hdr + ack_payload)
         logger.info(f"ACK sent seq={seq}")
@@ -107,19 +70,7 @@ def send_ack(node, seq: int) -> None:
 # ---------------------------------------------------------------------------
 def listen() -> None:
     """Initialise the radio and print/log packets. Send ACKs for DATA."""
-    ensure_driver()
-    try:
-        node = sx126x.sx126x(serial_num=SERIAL_PORT,
-                             freq=FREQ_MHZ,
-                             addr=MY_ADDR,
-                             power=POWER_DBM,
-                             rssi=True,
-                             air_speed=AIR_SPEED,
-                             relay=False)
-    except Exception as e:
-        logger.error(f"Radio init failed: {e}")
-        sys.exit(3)
-
+    node = common.init_radio(my_addr=MY_ADDR, for_tx=False)
     print("LoRa receiver started. Waiting for packets…")
 
     # Patterns for parsing the driver stdout
