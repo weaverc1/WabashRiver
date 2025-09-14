@@ -52,7 +52,7 @@ CSV_URL    = f"http://{STORM_HOST}/data/{SITE_ID}.csv"
 # ---------------------------
 # Paths & logging
 # ---------------------------
-BASE_DIR  = os.path.expanduser("~/storm/lora_app")
+BASE_DIR  = os.path.expanduser("~/storm")
 LOG_DIR   = os.path.join(BASE_DIR, "logs")
 STATE_DIR = os.path.join(BASE_DIR, "state")
 os.makedirs(LOG_DIR, exist_ok=True)
