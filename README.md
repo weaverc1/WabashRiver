@@ -39,13 +39,17 @@ The main configuration variables are located at the top of `lora_app.py`:
 - `SITE_ID`: The identifier for the data site (e.g., "Hutsonville"). This is used to construct the CSV data URL.
 - `STORM_HOST`: The IP address or hostname of the Storm3 device.
 - `CSV_URL`: The full URL to the CSV data file, constructed from `STORM_HOST` and `SITE_ID`.
-- `BASE_DIR`: The base directory (`/storm`) where logs and state files are stored.
+
+- `BASE_DIR`: The base directory (`~/storm`) where logs and state files are stored.
+
 
 ## Directory Structure
 
 The application creates the following directory structure:
 
-- `/storm/`
+
+- `~/storm/`
+
   - `logs/`: Contains log files for both transmitter and receiver, as well as any received data.
     - `lora_tx.log`: Log for the transmitter.
     - `lora_rx.log`: Log for the receiver.
