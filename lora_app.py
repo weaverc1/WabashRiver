@@ -768,12 +768,38 @@ class LoRaNode:
                         time.sleep(0.2)  # Reasonable delay to prevent CPU spinning
                         continue
 
-                if len(raw_data) > 3:  # Minimum frame size: src_addr(2) + freq(1) + payload
-                    # Parse LoRa frame as received: [src_addr_h, src_addr_l, src_freq, payload..., rssi]
-                    src_addr = (raw_data[0] << 8) + raw_data[1]
-                    src_freq = raw_data[2]
-                    packet_data = raw_data[3:-1] if self.node.rssi else raw_data[3:]
+                # The LoRa module prepends a 3-byte hardware header (src_addr, src_freq).
+                # The application then sends its own 6-byte header. Total header = 9 bytes.
+                # Frame: [hw_src_addr(2), hw_src_freq(1), app_dst_addr(2), app_dst_freq(1), app_src_addr(2), app_src_freq(1), payload..., rssi(1)]
+                MIN_PACKET_LEN = 9 + 1 + 1 # 9-byte header + min 1-byte payload + 1-byte rssi
+
+                if len(raw_data) > MIN_PACKET_LEN:
+                    # Hardware-level header (from the LoRa module)
+                    hw_src_addr = (raw_data[0] << 8) + raw_data[1]
+                    hw_src_freq = raw_data[2]
+
+                    # Application-level header (from send_packet function)
+                    app_dst_addr = (raw_data[3] << 8) + raw_data[4]
+                    # app_dst_freq = raw_data[5]
+                    app_src_addr = (raw_data[6] << 8) + raw_data[7]
+                    # app_src_freq = raw_data[8]
+
+                    # The actual payload starts after the combined 9-byte header
+                    packet_data = raw_data[9:-1] if self.node.rssi else raw_data[9:]
                     rssi_value = raw_data[-1] if self.node.rssi else None
+
+                    # 1. Check if the packet is from our designated target (using the reliable HW address)
+                    if hw_src_addr != self.target_addr:
+                        continue  # Silently ignore packets from other sources
+
+                    # 2. Check if the packet is addressed to this node (using the App address)
+                    if app_dst_addr != self.addr:
+                        continue # Silently ignore packets for other nodes.
+
+                    # Sanity check: the source address in the app header should match the hardware one
+                    if app_src_addr != hw_src_addr:
+                        self.log_and_print(f"RX: Mismatch between HW source ({hw_src_addr}) and App source ({app_src_addr}). Ignoring.")
+                        continue
 
                     # Validate RSSI value (should be reasonable for LoRa)
                     valid_rssi = True
@@ -783,10 +809,6 @@ class LoRaNode:
                         if calculated_rssi < -120 or calculated_rssi > -30:
                             valid_rssi = False
                             self.log_and_print(f"RX: Dropping packet with invalid RSSI: {calculated_rssi}dBm")
-
-                    # We accept packets from our target (the TX unit)
-                    if src_addr != self.target_addr:
-                        continue  # Silently ignore packets from other sources
 
                     # Skip processing if packet seems corrupted (invalid RSSI often indicates corruption)
                     if not valid_rssi:
@@ -815,8 +837,8 @@ class LoRaNode:
                             self.update_stats('noise_readings', noise_rssi)
 
                     # Log reception details
-                    freq_mhz = src_freq + self.node.start_freq
-                    self.log_and_print(f"RX: Received from addr {src_addr} at {freq_mhz}.125MHz")
+                    freq_mhz = self.node.freq
+                    self.log_and_print(f"RX: Received from addr {hw_src_addr} at {freq_mhz}MHz (HW offset: {hw_src_freq})")
 
                     if packet_rssi is not None:
                         noise_str = f"{noise_rssi}dBm" if noise_rssi is not None else "N/A"
