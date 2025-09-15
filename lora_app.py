@@ -768,12 +768,27 @@ class LoRaNode:
                         time.sleep(0.2)  # Reasonable delay to prevent CPU spinning
                         continue
 
-                if len(raw_data) > 3:  # Minimum frame size: src_addr(2) + freq(1) + payload
-                    # Parse LoRa frame as received: [src_addr_h, src_addr_l, src_freq, payload..., rssi]
-                    src_addr = (raw_data[0] << 8) + raw_data[1]
-                    src_freq = raw_data[2]
-                    packet_data = raw_data[3:-1] if self.node.rssi else raw_data[3:]
+                # The frame format sent by TX is:
+                # [dst_addr_h, dst_addr_l, dst_freq_offset, src_addr_h, src_addr_l, src_freq_offset, payload..., rssi]
+                # Header is 6 bytes. Payload is variable. RSSI is 1 byte at the end.
+                if len(raw_data) > 7: # Minimum frame size: 6 (header) + 1 (payload) + 1 (rssi)
+                    # Parse the full 6-byte header
+                    dst_addr = (raw_data[0] << 8) + raw_data[1]
+                    # dst_freq_offset = raw_data[2]
+                    src_addr = (raw_data[3] << 8) + raw_data[4]
+                    src_freq_offset = raw_data[5]
+
+                    # The actual payload starts after the 6-byte header
+                    packet_data = raw_data[6:-1] if self.node.rssi else raw_data[6:]
                     rssi_value = raw_data[-1] if self.node.rssi else None
+
+                    # 1. Check if the packet is addressed to this node.
+                    if dst_addr != self.addr:
+                        continue # Silently ignore packets for other nodes.
+
+                    # 2. Check if the packet is from our designated target.
+                    if src_addr != self.target_addr:
+                        continue  # Silently ignore packets from other sources
 
                     # Validate RSSI value (should be reasonable for LoRa)
                     valid_rssi = True
@@ -783,10 +798,6 @@ class LoRaNode:
                         if calculated_rssi < -120 or calculated_rssi > -30:
                             valid_rssi = False
                             self.log_and_print(f"RX: Dropping packet with invalid RSSI: {calculated_rssi}dBm")
-
-                    # We accept packets from our target (the TX unit)
-                    if src_addr != self.target_addr:
-                        continue  # Silently ignore packets from other sources
 
                     # Skip processing if packet seems corrupted (invalid RSSI often indicates corruption)
                     if not valid_rssi:
@@ -815,8 +826,8 @@ class LoRaNode:
                             self.update_stats('noise_readings', noise_rssi)
 
                     # Log reception details
-                    freq_mhz = src_freq + self.node.start_freq
-                    self.log_and_print(f"RX: Received from addr {src_addr} at {freq_mhz}.125MHz")
+                    freq_mhz = self.node.freq
+                    self.log_and_print(f"RX: Received from addr {src_addr} at {freq_mhz}MHz (offset: {src_freq_offset})")
 
                     if packet_rssi is not None:
                         noise_str = f"{noise_rssi}dBm" if noise_rssi is not None else "N/A"
