@@ -768,6 +768,7 @@ class LoRaNode:
                         time.sleep(0.2)  # Reasonable delay to prevent CPU spinning
                         continue
 
+
                 # The frame format sent by TX is:
                 # [dst_addr_h, dst_addr_l, dst_freq_offset, src_addr_h, src_addr_l, src_freq_offset, payload..., rssi]
                 # Header is 6 bytes. Payload is variable. RSSI is 1 byte at the end.
@@ -827,7 +828,9 @@ class LoRaNode:
 
                     # Log reception details
                     freq_mhz = self.node.freq
+
                     self.log_and_print(f"RX: Received from addr {src_addr} at {freq_mhz}MHz (offset: {src_freq_offset})")
+
 
                     if packet_rssi is not None:
                         noise_str = f"{noise_rssi}dBm" if noise_rssi is not None else "N/A"
