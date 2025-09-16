@@ -82,7 +82,7 @@ class LoRaNode:
             if not os.path.exists(self.csv_path):
                 try:
                     with open(self.csv_path, "w") as f:
-                        f.write("iso_time,seq,p_rssi,n_rssi,snr,board_temp_c,csv_date,csv_time,riverstage,rain_gauge,site_id,tx_timestamp\n")
+                        f.write("iso_time,seq,p_rssi,n_rssi,snr,board_temp_c,csv_date,csv_time,riverstage,rain_gauge,tx_timestamp\n")
                 except Exception as e:
                     self.log_and_print(f"Failed to create CSV log file: {e}")
 
@@ -246,32 +246,47 @@ class LoRaNode:
                     self.stats[stat_type] += 1
 
     def create_packet(self, packet_type: str, seq_num: int, **kwargs):
-        """Create packet with checksum using JSON format"""
-        packet_data = {
-            'type': packet_type,
-            'seq': seq_num,
-            'src_addr': self.addr,
-            'dst_addr': self.target_addr,
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        # Add additional data based on packet type
+        """Create packet with checksum using shortened JSON format"""
         if packet_type == 'STORM_DATA':
-            packet_data.update({
-                'board_temp_c': kwargs.get('board_temp_c'),
-                'csv_date': kwargs.get('csv_date'),
-                'csv_time': kwargs.get('csv_time'),
-                'riverstage': kwargs.get('riverstage'),
-                'rain_gauge': kwargs.get('rain_gauge'),
-                'site_id': kwargs.get('site_id')
-            })
+            packet_data = {
+                'seq': seq_num,
+                'src_addr': self.addr,
+                'dst_addr': self.target_addr,
+                'ts': datetime.now().strftime('%H:%M:%S'),  # shortened timestamp
+                'T': round(kwargs.get('board_temp_c', 0), 1),  # board_temp_c -> T
+                'c_date': kwargs.get('csv_date'),  # csv_date -> c_date
+                'c_time': kwargs.get('csv_time'),  # csv_time -> c_time
+                'd': kwargs.get('riverstage'),  # riverstage -> d
+                'r': kwargs.get('rain_gauge')   # rain_gauge -> r
+            }
+        elif packet_type == 'ACK':
+            packet_data = {
+                'seq': seq_num,
+                'src_addr': self.addr,
+                'dst_addr': self.target_addr,
+                'ts': datetime.now().strftime('%H:%M:%S'),  # shortened timestamp
+                'ack': True
+            }
+        else:
+            # Fallback
+            packet_data = {
+                'seq': seq_num,
+                'src_addr': self.addr,
+                'dst_addr': self.target_addr,
+                'ts': datetime.now().strftime('%H:%M:%S')
+            }
 
         # Create JSON and add checksum
         packet_json = json.dumps(packet_data, separators=(',', ':'))
-        checksum = hashlib.md5(packet_json.encode()).hexdigest()[:8]
+        checksum = hashlib.md5(packet_json.encode()).hexdigest()[:6]  # shortened checksum
         packet_data['checksum'] = checksum
 
-        return json.dumps(packet_data, separators=(',', ':')).encode()
+        final_json = json.dumps(packet_data, separators=(',', ':'))
+        
+        # Log the packet size for monitoring
+        self.log_and_print(f"Packet size: {len(final_json)} bytes")
+        
+        return final_json.encode()
 
     def verify_packet(self, packet_data):
         """Verify packet checksum"""
@@ -282,7 +297,7 @@ class LoRaNode:
                 return False, None
 
             packet_json = json.dumps(data, separators=(',', ':'))
-            expected_checksum = hashlib.md5(packet_json.encode()).hexdigest()[:8]
+            expected_checksum = hashlib.md5(packet_json.encode()).hexdigest()[:6]
 
             if checksum == expected_checksum:
                 data['checksum'] = checksum  # Put it back
@@ -381,8 +396,7 @@ class LoRaNode:
                     csv_date=csv_date,
                     csv_time=csv_time,
                     riverstage=riverstage,
-                    rain_gauge=rain_gauge,
-                    site_id=SITE_ID
+                    rain_gauge=rain_gauge
                 )
 
                 self.log_and_print(f"TX Seq#{self.seq_number}: Sending Storm3 data packet.")
@@ -525,11 +539,12 @@ class LoRaNode:
                     valid, packet_info = self.verify_packet(packet_data)
 
                     if valid:
-                        if packet_info['type'] == 'STORM_DATA':
-                            self.log_and_print(f"RX: STORM_DATA packet Seq#{packet_info['seq']} from {packet_info.get('site_id', 'Unknown')}")
-                            self.log_and_print(f"RX: Date: {packet_info.get('csv_date')} {packet_info.get('csv_time')}")
-                            self.log_and_print(f"RX: River: {packet_info.get('riverstage')}, Rain: {packet_info.get('rain_gauge')}")
-                            self.log_and_print(f"RX: Board Temp: {packet_info.get('board_temp_c')}°C")
+                        # Handle STORM_DATA packets (now using shortened format)
+                        if 'd' in packet_info and 'r' in packet_info:  # Shortened STORM_DATA packet
+                            self.log_and_print(f"RX: STORM_DATA packet Seq#{packet_info['seq']}")
+                            self.log_and_print(f"RX: Date: {packet_info.get('c_date')} {packet_info.get('c_time')}")
+                            self.log_and_print(f"RX: River: {packet_info.get('d')}, Rain: {packet_info.get('r')}")
+                            self.log_and_print(f"RX: Board Temp: {packet_info.get('T')}°C")
 
                             self.update_stats('packets_received')
 
@@ -538,10 +553,10 @@ class LoRaNode:
                                 with open(self.csv_path, "a") as f:
                                     ts = datetime.now().isoformat()
                                     f.write(f"{ts},{packet_info['seq']},{packet_rssi},{noise_rssi},{snr},"
-                                            f"{packet_info.get('board_temp_c', '')}"
-                                            f",\"{packet_info.get('csv_date', '')}\",\"{packet_info.get('csv_time', '')}\""
-                                            f",\"{packet_info.get('riverstage', '')}\",\"{packet_info.get('rain_gauge', '')}\""
-                                            f",\"{packet_info.get('site_id', '')}\",\"{packet_info.get('timestamp', '')}\"\n")
+                                            f"{packet_info.get('T', '')}"
+                                            f",\"{packet_info.get('c_date', '')}\",\"{packet_info.get('c_time', '')}\""
+                                            f",\"{packet_info.get('d', '')}\",\"{packet_info.get('r', '')}\""
+                                            f",\"{packet_info.get('ts', '')}\"\n")
                             except Exception as e:
                                 self.log_and_print(f"Failed to write to CSV log: {e}")
 
@@ -553,7 +568,7 @@ class LoRaNode:
                             else:
                                 self.log_and_print(f"RX: Failed to send ACK for Seq#{packet_info['seq']}")
 
-                        elif packet_info['type'] == 'ACK':
+                        elif 'ack' in packet_info:  # ACK packet
                             seq_num = packet_info['seq']
                             if seq_num in self.pending_acks:
                                 self.log_and_print(f"RX: ACK received for Seq#{seq_num}")
