@@ -2,22 +2,25 @@
 # -*- coding: UTF-8 -*-
 
 """
-LoRa application for Storm3 data transmission.
+LoRa application for acquiring, transmitting and receiving Storm3.
 This script can run as a transmitter or a receiver using JSON packet format.
 
 Transmitter mode:
 - Fetches the latest data from a Storm3 device's CSV export.
 - Transmits the data using LoRa with JSON packets and ACK mechanism.
 - Maintains state to avoid re-transmitting old data.
+- Handles remote data fetch requests from receivers.
 
 Receiver mode:
 - Listens for LoRa packets.
 - Sends ACKs for received data packets.
 - Logs received data and statistics.
+- Can request historical data from transmitters.
 
 Usage:
   python lora_app.py tx --addr 1
   python lora_app.py rx --addr 2
+  python lora_app.py rx --addr 2 --fetch-start "2025-09-15T14:00:00" --fetch-end "2025-09-16T15:00:00"
 """
 
 import sys
@@ -63,10 +66,22 @@ os.makedirs(STATE_DIR, exist_ok=True)
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 
 class LoRaNode:
-    def __init__(self, mode, addr, target_addr=None):
+    CHUNK_SIZE = 200  # LoRa packet size limit for payload
+    MAX_RETRIES = 3
+    ACK_TIMEOUT = 10
+    FETCH_REQUEST_TIMEOUT = 30
+    
+    def __init__(self, mode, addr, target_addr=None, fetch_start=None, fetch_end=None):
         self.mode = mode
         self.addr = addr
         self.target_addr = target_addr if target_addr else (2 if mode == 'tx' else 1)
+        self.fetch_start = fetch_start
+        self.fetch_end = fetch_end
+        
+        # Transfer management
+        self.pending_transfers = {}  # For TX side - outgoing data transfers
+        self.pending_downloads = {}  # For RX side - incoming data transfers
+        self.transfer_lock = Lock()
 
         self.log_lock = Lock()
         self.log_filename = os.path.join(LOG_DIR, f"lora_{mode}.log")
@@ -98,6 +113,10 @@ class LoRaNode:
             'acks_received': 0,
             'failed_packets': 0,
             'invalid_packets': 0,
+            'fetch_requests_sent': 0,
+            'fetch_requests_handled': 0,
+            'data_chunks_sent': 0,
+            'data_chunks_received': 0,
             'start_time': time.time(),
             'rssi_readings': [],
             'snr_readings': [],
@@ -226,6 +245,11 @@ class LoRaNode:
                              f"ACKs_received={self.stats['acks_received']}, Failed={self.stats['failed_packets']}, "
                              f"Invalid={self.stats['invalid_packets']}, Success_rate={success_rate:.1f}%")
 
+            self.log_and_print(f"STATS: Fetch_requests_sent={self.stats['fetch_requests_sent']}, "
+                             f"Fetch_requests_handled={self.stats['fetch_requests_handled']}, "
+                             f"Chunks_sent={self.stats['data_chunks_sent']}, "
+                             f"Chunks_received={self.stats['data_chunks_received']}")
+
             if self.stats['rssi_readings']:
                 self.log_and_print(f"STATS: Avg_RSSI={avg_rssi:.1f}dBm, Avg_SNR={avg_snr:.1f}dB, "
                                  f"Avg_Noise={avg_noise:.1f}dBm, RSSI_samples={len(self.stats['rssi_readings'])}")
@@ -245,26 +269,19 @@ class LoRaNode:
                 else:
                     self.stats[stat_type] += 1
 
-    def create_packet(self, packet_type: str, seq_num: int, **kwargs):
+    def create_packet(self, packet_type: str, seq_num: int, payload: dict = None, request_id: Optional[str] = None):
         """Create packet with checksum using JSON format"""
         packet_data = {
             'type': packet_type,
             'seq': seq_num,
             'src_addr': self.addr,
             'dst_addr': self.target_addr,
+            'payload': payload if payload is not None else {},
             'timestamp': datetime.now().isoformat()
         }
         
-        # Add additional data based on packet type
-        if packet_type == 'STORM_DATA':
-            packet_data.update({
-                'board_temp_c': kwargs.get('board_temp_c'),
-                'csv_date': kwargs.get('csv_date'),
-                'csv_time': kwargs.get('csv_time'),
-                'riverstage': kwargs.get('riverstage'),
-                'rain_gauge': kwargs.get('rain_gauge'),
-                'site_id': kwargs.get('site_id')
-            })
+        if request_id:
+            packet_data['request_id'] = request_id
 
         # Create JSON and add checksum
         packet_json = json.dumps(packet_data, separators=(',', ':'))
@@ -320,6 +337,404 @@ class LoRaNode:
             self.log_and_print(f"Error sending packet: {e}")
             return False
 
+    def send_fetch_range_request(self):
+        """Compose and send a FETCH_RANGE request."""
+        request_id = str(uuid.uuid4())
+        self.log_and_print(f"RX: Initiating data fetch request {request_id} for range "
+                         f"[{self.fetch_start} to {self.fetch_end}]")
+        
+        payload = {
+            'start_ts': self.fetch_start,
+            'end_ts': self.fetch_end,
+        }
+        
+        packet = self.create_packet(
+            packet_type='FETCH_RANGE',
+            seq_num=self.seq_number,
+            payload=payload,
+            request_id=request_id
+        )
+        
+        if self.send_packet(packet):
+            self.log_and_print(f"RX: FETCH_RANGE request sent for ID {request_id}")
+            self.update_stats('fetch_requests_sent')
+            self.seq_number += 1
+            return True
+        else:
+            self.log_and_print(f"RX: Failed to send FETCH_RANGE request for ID {request_id}")
+            return False
+
+    def handle_fetch_range_request(self, packet_info):
+        """
+        Handles a FETCH_RANGE request by spawning a new thread to process it.
+        This ensures the main receiver loop is not blocked.
+        """
+        self.log_and_print("TX: Spawning new thread to handle FETCH_RANGE request.")
+        self.update_stats('fetch_requests_handled')
+        
+        thread = threading.Thread(
+            target=self._process_fetch_request_thread,
+            args=(packet_info,),
+            daemon=True
+        )
+        thread.start()
+
+    def _process_fetch_request_thread(self, packet_info):
+        """
+        The actual processing logic for a fetch request. Runs in a separate thread.
+        Streams the source CSV, filters it, compresses the result, and sends a manifest.
+        """
+        request_id = packet_info.get('request_id')
+        payload = packet_info.get('payload', {})
+        start_ts_str = payload.get('start_ts')
+        end_ts_str = payload.get('end_ts')
+        
+        if not all([request_id, start_ts_str, end_ts_str]):
+            self.log_and_print(f"TX: Received invalid FETCH_RANGE request. Missing fields.")
+            return
+        
+        self.log_and_print(f"TX: Processing FETCH_RANGE request {request_id} for range [{start_ts_str} to {end_ts_str}]")
+        
+        try:
+            start_dt = datetime.fromisoformat(start_ts_str)
+            end_dt = datetime.fromisoformat(end_ts_str)
+        except ValueError:
+            self.log_and_print(f"TX: Invalid timestamp format in FETCH_RANGE request {request_id}")
+            return
+        
+        first_ts = None
+        last_ts = None
+        records_found = 0
+        gzipped_buffer = io.BytesIO()
+        
+        try:
+            # 1. Open HTTP stream and process line by line
+            req = urllib.request.Request(CSV_URL, method="GET")
+            req.add_header("Accept", "text/csv, */*;q=0.1")
+            req.add_header("User-Agent", "storm3_tx/1.1")
+            
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status != 200:
+                    self.log_and_print(f"TX: Failed to fetch CSV, status {resp.status}")
+                    return
+                
+                # Handle gzipped response
+                data = resp.read()
+                if resp.headers.get("Content-Encoding", "") == "gzip":
+                    data = gzip.decompress(data)
+                
+                text_data = data.decode('utf-8', errors='replace')
+                text_stream = io.StringIO(text_data)
+                reader = csv.reader(text_stream)
+                
+                header = next(reader, None)  # Skip header
+                
+                # 2. Filter, compress and store results on the fly
+                with gzip.GzipFile(fileobj=gzipped_buffer, mode='wb') as gz_writer:
+                    with io.TextIOWrapper(gz_writer, encoding='utf-8') as text_writer:
+                        # Write header first
+                        if header:
+                            text_writer.write(",".join(header) + "\n")
+                        
+                        for row in reader:
+                            if len(row) >= 2 and row[0] and row[1]:
+                                try:
+                                    # Parse date/time - adjust format based on actual CSV format
+                                    date_str = row[0].strip()
+                                    time_str = row[1].strip()
+                                    
+                                    # Try different date formats
+                                    date_formats = [
+                                        "%m/%d/%y %H:%M:%S",
+                                        "%m/%d/%Y %H:%M:%S", 
+                                        "%Y-%m-%d %H:%M:%S",
+                                        "%d/%m/%y %H:%M:%S",
+                                        "%d/%m/%Y %H:%M:%S"
+                                    ]
+                                    
+                                    record_dt = None
+                                    datetime_str = f"{date_str} {time_str}"
+                                    
+                                    for fmt in date_formats:
+                                        try:
+                                            record_dt = datetime.strptime(datetime_str, fmt)
+                                            break
+                                        except ValueError:
+                                            continue
+                                    
+                                    if record_dt and start_dt <= record_dt < end_dt:
+                                        text_writer.write(",".join(row) + "\n")
+                                        records_found += 1
+                                        record_ts_str = record_dt.isoformat()
+                                        if first_ts is None:
+                                            first_ts = record_ts_str
+                                        last_ts = record_ts_str
+                                        
+                                except (ValueError, IndexError):
+                                    continue  # Skip malformed rows silently in stream
+            
+            data_bytes = gzipped_buffer.getvalue()
+            
+        except Exception as e:
+            self.log_and_print(f"TX: Error processing CSV stream for {request_id}: {e}")
+            return
+        
+        # 3. Generate and send the manifest
+        total_chunks = math.ceil(len(data_bytes) / self.CHUNK_SIZE) if data_bytes else 0
+        
+        manifest = {
+            'records_found': records_found,
+            'bytes_estimate': len(data_bytes),
+            'chunk_size': self.CHUNK_SIZE,
+            'total_chunks': total_chunks,
+            'first_ts': first_ts,
+            'last_ts': last_ts,
+            'content_encoding': 'gzip' if data_bytes else 'none'
+        }
+        
+        with self.transfer_lock:
+            self.pending_transfers[request_id] = {
+                'data': data_bytes,
+                'manifest': manifest,
+                'next_chunk_index': 0,
+                'total_chunks': total_chunks,
+            }
+        
+        self.log_and_print(f"TX: Prepared {manifest['records_found']} records ({manifest['bytes_estimate']} bytes) for transfer.")
+        
+        manifest_packet = self.create_packet('MANIFEST', self.seq_number, manifest, request_id)
+        if self.send_packet(manifest_packet):
+            self.log_and_print(f"TX: Sent MANIFEST for request {request_id} with Seq#{self.seq_number}")
+            with self.transfer_lock:
+                if request_id in self.pending_transfers:
+                    self.pending_transfers[request_id]['manifest_seq'] = self.seq_number
+            self.update_stats('packets_sent')
+            self.seq_number += 1
+        else:
+            self.log_and_print(f"TX: Failed to send MANIFEST for request {request_id}")
+            with self.transfer_lock:
+                self.pending_transfers.pop(request_id, None)
+
+    def handle_manifest(self, packet_info):
+        """Handle an incoming MANIFEST packet on the receiver."""
+        if self.mode != 'rx':
+            return
+            
+        request_id = packet_info.get('request_id')
+        manifest = packet_info.get('payload', {})
+        
+        if not request_id or not manifest:
+            self.log_and_print("RX: Received invalid MANIFEST packet.")
+            return
+            
+        self.log_and_print(f"RX: Received MANIFEST for request {request_id}:")
+        self.log_and_print(f"    Records found: {manifest.get('records_found')}")
+        self.log_and_print(f"    Total size: {manifest.get('bytes_estimate')} bytes")
+        self.log_and_print(f"    Total chunks: {manifest.get('total_chunks')}")
+        
+        if manifest.get('total_chunks', 0) == 0:
+            self.log_and_print(f"RX: Transfer for {request_id} complete (0 chunks).")
+            return
+            
+        with self.transfer_lock:
+            self.pending_downloads[request_id] = {
+                'manifest': manifest,
+                'chunks': {},
+                'chunks_received': 0,
+                'data': b''  # To store re-assembled data
+            }
+        
+        self.log_and_print(f"RX: Acknowledging MANIFEST. Ready to receive data chunks for {request_id}.")
+        
+        ack_packet = self.create_packet(
+            packet_type='ACK',
+            seq_num=packet_info['seq'],
+            request_id=request_id
+        )
+        
+        if self.send_packet(ack_packet):
+            self.log_and_print(f"RX: Sent ACK for MANIFEST (Seq#{packet_info['seq']})")
+            self.update_stats('acks_sent')
+        else:
+            self.log_and_print(f"RX: Failed to send ACK for MANIFEST (Seq#{packet_info['seq']})")
+
+    def handle_data_chunk(self, packet_info):
+        """Handle an incoming DATA_CHUNK packet on the receiver."""
+        request_id = packet_info.get('request_id')
+        payload = packet_info.get('payload', {})
+        chunk_index = payload.get('chunk_index')
+        chunk_data_b64 = payload.get('data')
+        
+        if not request_id:
+            self.log_and_print(f"RX: Received chunk without request_id. Discarding.")
+            return
+            
+        with self.transfer_lock:
+            if request_id not in self.pending_downloads:
+                self.log_and_print(f"RX: Received chunk for unknown/completed request {request_id}. Discarding.")
+                return
+            download_info = self.pending_downloads[request_id]
+        
+        if chunk_index is None or chunk_data_b64 is None:
+            self.log_and_print(f"RX: Received invalid DATA_CHUNK packet for {request_id}. Discarding.")
+            return
+        
+        if chunk_index not in download_info['chunks']:
+            try:
+                chunk_data = base64.b64decode(chunk_data_b64)
+                with self.transfer_lock:
+                    download_info['chunks'][chunk_index] = chunk_data
+                    download_info['chunks_received'] += 1
+                
+                total_chunks = download_info['manifest']['total_chunks']
+                self.log_and_print(f"RX: Stored chunk {chunk_index + 1}/{total_chunks} for {request_id} ({len(chunk_data)} bytes)")
+                self.update_stats('data_chunks_received')
+                
+            except (TypeError, ValueError):
+                self.log_and_print(f"RX: Failed to decode base64 data for chunk {chunk_index + 1}. Discarding.")
+                return  # Don't ACK a corrupted chunk
+        else:
+            self.log_and_print(f"RX: Received duplicate chunk {chunk_index + 1}. Discarding.")
+        
+        # Always ACK receipt so the transmitter can move on
+        ack_packet = self.create_packet('ACK', packet_info['seq'], request_id=request_id)
+        if self.send_packet(ack_packet):
+            self.update_stats('acks_sent')
+        else:
+            self.log_and_print(f"RX: Failed to send ACK for chunk {chunk_index + 1}")
+        
+        # Check if transfer is complete
+        with self.transfer_lock:
+            total_chunks = download_info['manifest']['total_chunks']
+            if total_chunks > 0 and download_info['chunks_received'] == total_chunks:
+                self.log_and_print(f"RX: All {total_chunks} chunks received for {request_id}.")
+                self._reassemble_and_save_data(request_id)
+
+    def handle_transfer_done(self, packet_info):
+        """Handles a TRANSFER_DONE packet, confirming the end of a transfer."""
+        request_id = packet_info.get('request_id')
+        self.log_and_print(f"RX: Received TRANSFER_DONE for {request_id}.")
+        
+        # Acknowledge the final packet
+        ack_packet = self.create_packet('ACK', packet_info['seq'], request_id=request_id)
+        if self.send_packet(ack_packet):
+            self.update_stats('acks_sent')
+        else:
+            self.log_and_print(f"RX: Failed to send final ACK for {request_id}")
+        
+        # Verify chunk count and trigger reassembly if it hasn't happened yet
+        with self.transfer_lock:
+            download_info = self.pending_downloads.get(request_id)
+            if download_info:
+                total_chunks_manifest = download_info['manifest']['total_chunks']
+                if download_info['chunks_received'] != total_chunks_manifest:
+                    self.log_and_print(f"RX: WARNING - Transfer for {request_id} ended, but chunk count mismatch.")
+                    self.log_and_print(f"RX: Expected {total_chunks_manifest}, received {download_info['chunks_received']}")
+                else:
+                    self.log_and_print(f"RX: Transfer for {request_id} confirmed complete.")
+                
+                # Reassembly is normally triggered by the last chunk, but this is a fallback.
+                if request_id in self.pending_downloads:
+                    self._reassemble_and_save_data(request_id)
+
+    def _reassemble_and_save_data(self, request_id):
+        """Reassembles chunks for a completed download and saves to a file."""
+        with self.transfer_lock:
+            download_info = self.pending_downloads.get(request_id)
+            if not download_info:
+                return
+        
+        self.log_and_print(f"RX: Reassembling data for request {request_id}.")
+        
+        # Sort chunks by index and join them
+        sorted_chunks = sorted(download_info['chunks'].items())
+        full_data_bytes = b''.join([chunk_data for chunk_index, chunk_data in sorted_chunks])
+        
+        # Decompress data if necessary, based on the manifest
+        content_encoding = download_info['manifest'].get('content_encoding')
+        if content_encoding == 'gzip':
+            try:
+                self.log_and_print(f"RX: Decompressing {len(full_data_bytes)} bytes of gzip data...")
+                full_data_bytes = gzip.decompress(full_data_bytes)
+            except gzip.BadGzipFile as e:
+                self.log_and_print(f"RX: Error decompressing data for {request_id}: {e}")
+                with self.transfer_lock:
+                    self.pending_downloads.pop(request_id, None)  # Clean up failed download
+                return
+        
+        # Save the reassembled data to a file
+        output_filename = os.path.join(LOG_DIR, f"recovered_data_{request_id}.csv")
+        try:
+            with open(output_filename, "wb") as f:
+                f.write(full_data_bytes)
+            self.log_and_print(f"RX: Successfully saved reassembled data to {output_filename}")
+            self.log_and_print(f"RX: File size: {len(full_data_bytes)} bytes, Records: {download_info['manifest']['records_found']}")
+        except IOError as e:
+            self.log_and_print(f"RX: Error saving reassembled data for {request_id}: {e}")
+        
+        # Clean up the completed download from memory
+        with self.transfer_lock:
+            self.pending_downloads.pop(request_id, None)
+
+    def send_next_chunk(self, request_id):
+        """Sends the next available data chunk for a given transfer request."""
+        with self.transfer_lock:
+            transfer_info = self.pending_transfers.get(request_id)
+            if not transfer_info:
+                self.log_and_print(f"TX: Cannot send chunk, no pending transfer for {request_id}")
+                return
+            
+            chunk_index = transfer_info['next_chunk_index']
+            total_chunks = transfer_info['total_chunks']
+        
+        if chunk_index >= total_chunks:
+            self.log_and_print(f"TX: All chunks sent for {request_id}. Sending TRANSFER_DONE.")
+            done_packet = self.create_packet(
+                packet_type='TRANSFER_DONE',
+                seq_num=self.seq_number,
+                request_id=request_id,
+                payload={'total_chunks': total_chunks}
+            )
+            if self.send_packet(done_packet):
+                with self.transfer_lock:
+                    if request_id in self.pending_transfers:
+                        self.pending_transfers[request_id]['done_seq'] = self.seq_number
+                self.update_stats('packets_sent')
+                self.seq_number += 1
+            else:
+                self.log_and_print(f"TX: Failed to send TRANSFER_DONE for {request_id}. Cleaning up.")
+                with self.transfer_lock:
+                    self.pending_transfers.pop(request_id, None)
+            return
+        
+        with self.transfer_lock:
+            data = transfer_info['data']
+            chunk_size = transfer_info['manifest']['chunk_size']
+        
+        start = chunk_index * chunk_size
+        end = start + chunk_size
+        chunk_data = data[start:end]
+        
+        payload = {
+            'chunk_index': chunk_index,
+            'total_chunks': total_chunks,
+            # base64 encode the binary data to ensure it's valid JSON
+            'data': base64.b64encode(chunk_data).decode('ascii')
+        }
+        
+        packet = self.create_packet('DATA_CHUNK', self.seq_number, payload, request_id)
+        if self.send_packet(packet):
+            self.log_and_print(f"TX: Sent chunk {chunk_index + 1}/{total_chunks} for {request_id} (Seq#{self.seq_number})")
+            with self.transfer_lock:
+                if request_id in self.pending_transfers:
+                    self.pending_transfers[request_id]['last_chunk_seq'] = self.seq_number
+                    self.pending_transfers[request_id]['next_chunk_index'] += 1
+            self.update_stats('packets_sent')
+            self.update_stats('data_chunks_sent')
+            self.seq_number += 1
+        else:
+            self.log_and_print(f"TX: Failed to send chunk {chunk_index + 1}/{total_chunks} for {request_id}")
+
     def cleanup_pending_acks(self):
         """Remove old pending ACKs to prevent memory growth"""
         if len(self.pending_acks) > self.max_pending_acks:
@@ -374,22 +789,22 @@ class LoRaNode:
                 # 3. Build and send packet
                 self.cleanup_pending_acks()
 
-                packet = self.create_packet(
-                    'STORM_DATA', 
-                    self.seq_number,
-                    board_temp_c=self.get_cpu_temp(),
-                    csv_date=csv_date,
-                    csv_time=csv_time,
-                    riverstage=riverstage,
-                    rain_gauge=rain_gauge,
-                    site_id=SITE_ID
-                )
+                storm_data = {
+                    'board_temp_c': self.get_cpu_temp(),
+                    'csv_date': csv_date,
+                    'csv_time': csv_time,
+                    'riverstage': riverstage,
+                    'rain_gauge': rain_gauge,
+                    'site_id': SITE_ID
+                }
+
+                packet = self.create_packet('STORM_DATA', self.seq_number, storm_data)
 
                 self.log_and_print(f"TX Seq#{self.seq_number}: Sending Storm3 data packet.")
 
                 success = False
                 retry_count = 0
-                max_retries = 3
+                max_retries = self.MAX_RETRIES
 
                 while retry_count < max_retries and not success:
                     if retry_count > 0:
@@ -402,7 +817,7 @@ class LoRaNode:
                         self.ack_received.clear()
                         self.pending_acks[self.seq_number] = retry_count
 
-                        if self.ack_received.wait(timeout=7):
+                        if self.ack_received.wait(timeout=self.ACK_TIMEOUT):
                             if self.seq_number not in self.pending_acks:
                                 self.log_and_print(f"TX Seq#{self.seq_number}: ACK received successfully")
                                 self.update_stats('acks_received')
@@ -525,11 +940,14 @@ class LoRaNode:
                     valid, packet_info = self.verify_packet(packet_data)
 
                     if valid:
-                        if packet_info['type'] == 'STORM_DATA':
-                            self.log_and_print(f"RX: STORM_DATA packet Seq#{packet_info['seq']} from {packet_info.get('site_id', 'Unknown')}")
-                            self.log_and_print(f"RX: Date: {packet_info.get('csv_date')} {packet_info.get('csv_time')}")
-                            self.log_and_print(f"RX: River: {packet_info.get('riverstage')}, Rain: {packet_info.get('rain_gauge')}")
-                            self.log_and_print(f"RX: Board Temp: {packet_info.get('board_temp_c')}°C")
+                        packet_type = packet_info['type']
+                        
+                        if packet_type == 'STORM_DATA':
+                            payload = packet_info.get('payload', {})
+                            self.log_and_print(f"RX: STORM_DATA packet Seq#{packet_info['seq']} from {payload.get('site_id', 'Unknown')}")
+                            self.log_and_print(f"RX: Date: {payload.get('csv_date')} {payload.get('csv_time')}")
+                            self.log_and_print(f"RX: River: {payload.get('riverstage')}, Rain: {payload.get('rain_gauge')}")
+                            self.log_and_print(f"RX: Board Temp: {payload.get('board_temp_c')}°C")
 
                             self.update_stats('packets_received')
 
@@ -538,10 +956,10 @@ class LoRaNode:
                                 with open(self.csv_path, "a") as f:
                                     ts = datetime.now().isoformat()
                                     f.write(f"{ts},{packet_info['seq']},{packet_rssi},{noise_rssi},{snr},"
-                                            f"{packet_info.get('board_temp_c', '')}"
-                                            f",\"{packet_info.get('csv_date', '')}\",\"{packet_info.get('csv_time', '')}\""
-                                            f",\"{packet_info.get('riverstage', '')}\",\"{packet_info.get('rain_gauge', '')}\""
-                                            f",\"{packet_info.get('site_id', '')}\",\"{packet_info.get('timestamp', '')}\"\n")
+                                            f"{payload.get('board_temp_c', '')}"
+                                            f",\"{payload.get('csv_date', '')}\",\"{payload.get('csv_time', '')}\""
+                                            f",\"{payload.get('riverstage', '')}\",\"{payload.get('rain_gauge', '')}\""
+                                            f",\"{payload.get('site_id', '')}\",\"{packet_info.get('timestamp', '')}\"\n")
                             except Exception as e:
                                 self.log_and_print(f"Failed to write to CSV log: {e}")
 
@@ -553,14 +971,63 @@ class LoRaNode:
                             else:
                                 self.log_and_print(f"RX: Failed to send ACK for Seq#{packet_info['seq']}")
 
-                        elif packet_info['type'] == 'ACK':
+                        elif packet_type == 'ACK':
                             seq_num = packet_info['seq']
+                            request_id = packet_info.get('request_id')
+                            
+                            # Check if this ACK is part of a file transfer
+                            if self.mode == 'tx' and request_id:
+                                with self.transfer_lock:
+                                    transfer_info = self.pending_transfers.get(request_id)
+                                    if transfer_info:
+                                        manifest_seq = transfer_info.get('manifest_seq')
+                                        last_chunk_seq = transfer_info.get('last_chunk_seq')
+                                        done_seq = transfer_info.get('done_seq')
+                                        
+                                        if manifest_seq == seq_num:
+                                            self.log_and_print(f"TX: Received ACK for MANIFEST for {request_id}. Starting transfer.")
+                                            # Remove manifest_seq so we don't process this ACK again
+                                            del transfer_info['manifest_seq']
+                                            # Start sending chunks
+                                            self.send_next_chunk(request_id)
+                                        elif last_chunk_seq == seq_num:
+                                            chunk_num = transfer_info['next_chunk_index']
+                                            total_chunks = transfer_info['total_chunks']
+                                            self.log_and_print(f"TX: Received ACK for chunk {chunk_num}/{total_chunks}. Sending next.")
+                                            self.send_next_chunk(request_id)
+                                        elif done_seq == seq_num:
+                                            self.log_and_print(f"TX: Received ACK for TRANSFER_DONE for {request_id}. Transfer successful.")
+                                            self.pending_transfers.pop(request_id, None)
+                                        else:
+                                            self.log_and_print(f"TX: Received stale/unexpected ACK for transfer {request_id} (Seq#{seq_num})")
+                                        continue  # Packet handled, go to next iteration
+                            
+                            # Handle ACKs for regular data packets
                             if seq_num in self.pending_acks:
                                 self.log_and_print(f"RX: ACK received for Seq#{seq_num}")
                                 self.pending_acks.pop(seq_num)
                                 self.ack_received.set()
                             else:
                                 self.log_and_print(f"RX: Unexpected ACK for Seq#{seq_num}")
+
+                        elif packet_type == 'FETCH_RANGE':
+                            if self.mode == 'tx':
+                                self.handle_fetch_range_request(packet_info)
+
+                        elif packet_type == 'MANIFEST':
+                            if self.mode == 'rx':
+                                self.handle_manifest(packet_info)
+
+                        elif packet_type == 'DATA_CHUNK':
+                            if self.mode == 'rx':
+                                self.handle_data_chunk(packet_info)
+
+                        elif packet_type == 'TRANSFER_DONE':
+                            if self.mode == 'rx':
+                                self.handle_transfer_done(packet_info)
+
+                        else:
+                            self.log_and_print(f"RX: Unknown packet type: {packet_type}")
 
                     else:
                         self.log_and_print(f"RX: Invalid packet received (checksum failure)")
@@ -602,13 +1069,18 @@ class LoRaNode:
         """Run the application based on mode"""
         try:
             if self.mode == 'tx':
-                # Start receiver thread for ACKs
+                # Start receiver thread for ACKs and fetch requests
                 rx_thread = threading.Thread(target=self.receiver_loop, daemon=True)
                 rx_thread.start()
                 # Run transmitter in main thread
                 self.transmitter_loop()
-            else:
-                # Run receiver only
+            else:  # rx mode
+                # If fetch arguments are provided, send the data fetch request
+                if self.fetch_start and self.fetch_end:
+                    # Give the node a moment to initialize before sending
+                    time.sleep(1)
+                    self.send_fetch_range_request()
+                # Run receiver loop to listen for responses and regular packets
                 self.receiver_loop()
         except Exception as e:
             self.log_and_print(f"Fatal error: {e}")
@@ -620,14 +1092,33 @@ def main():
     parser.add_argument('mode', choices=['tx', 'rx'], help='Mode: tx (transmitter) or rx (receiver)')
     parser.add_argument('--addr', type=int, required=True, help='This device address')
     parser.add_argument('--target', type=int, help='Target device address (optional, auto-determined)')
+    parser.add_argument('--fetch-start', type=str, help='Start timestamp for data fetch (rx mode only, ISO-8601 format)')
+    parser.add_argument('--fetch-end', type=str, help='End timestamp for data fetch (rx mode only, ISO-8601 format)')
 
     args = parser.parse_args()
+
+    # Validate fetch arguments
+    if (args.fetch_start and not args.fetch_end) or (not args.fetch_start and args.fetch_end):
+        parser.error("--fetch-start and --fetch-end must be used together.")
+    
+    if args.fetch_start and args.mode == 'tx':
+        parser.error("--fetch-start and --fetch-end are only valid in rx mode.")
+
+    # Validate timestamp format if provided
+    if args.fetch_start:
+        try:
+            datetime.fromisoformat(args.fetch_start)
+            datetime.fromisoformat(args.fetch_end)
+        except ValueError:
+            parser.error("Timestamps must be in ISO-8601 format (e.g., '2025-09-15T14:00:00')")
 
     # Create and run application
     app = LoRaNode(
         mode=args.mode,
         addr=args.addr,
-        target_addr=args.target
+        target_addr=args.target,
+        fetch_start=args.fetch_start,
+        fetch_end=args.fetch_end
     )
 
     try:
