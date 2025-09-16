@@ -269,71 +269,68 @@ class LoRaNode:
                 else:
                     self.stats[stat_type] += 1
 
-def create_packet(self, packet_type: str, seq_num: int, payload: dict = None, request_id: Optional[str] = None):
-    """Create packet with checksum using JSON format"""
-    packet_data = {
-        'type': packet_type,
-        'seq': seq_num,
-        'src_addr': self.addr,
-        'dst_addr': self.target_addr,
-        'payload': payload if payload is not None else {},
-        'timestamp': datetime.now().isoformat()
-    }
-    
-    if request_id:
-        packet_data['request_id'] = request_id
+    def create_packet(self, packet_type: str, seq_num: int, payload: dict = None, request_id: Optional[str] = None):
+        """Create packet with checksum using JSON format"""
+        packet_data = {
+            'type': packet_type,
+            'seq': seq_num,
+            'src_addr': self.addr,
+            'dst_addr': self.target_addr,
+            'payload': payload if payload is not None else {},
+            'timestamp': datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        }
+        
+        if request_id:
+            packet_data['request_id'] = request_id
 
-    # Create JSON with consistent ordering and add checksum
-    packet_json = json.dumps(packet_data, separators=(',', ':'), sort_keys=True)
-    checksum = hashlib.md5(packet_json.encode()).hexdigest()[:8]
-    packet_data['checksum'] = checksum
+        # Create JSON with consistent ordering and add checksum
+        packet_json = json.dumps(packet_data, separators=(',', ':'), sort_keys=True)
+        checksum = hashlib.md5(packet_json.encode()).hexdigest()[:8]
+        packet_data['checksum'] = checksum
 
-    return json.dumps(packet_data, separators=(',', ':'), sort_keys=True).encode()
-
-def verify_packet(self, packet_data):
-    """Verify packet checksum"""
-    try:
-        data = json.loads(packet_data.decode())
-        received_checksum = data.pop('checksum', None)
-        if not received_checksum:
-            return False, None
-
-        # Calculate checksum with consistent ordering
-        packet_json = json.dumps(data, separators=(',', ':'), sort_keys=True)
-        expected_checksum = hashlib.md5(packet_json.encode()).hexdigest()[:8]
-
-        if received_checksum == expected_checksum:
-            data['checksum'] = received_checksum  # Put it back
-            return True, data
-        else:
-            self.log_and_print(f"Checksum mismatch: expected {expected_checksum}, got {received_checksum}")
-            return False, None
-    except Exception as e:
-        self.log_and_print(f"Packet verification error: {e}")
-        return False, None
+        final_packet = json.dumps(packet_data, separators=(',', ':'), sort_keys=True).encode()
+        
+        # Add packet size logging for debugging
+        packet_size = len(final_packet)
+        if packet_size > 240:
+            self.log_and_print(f"WARNING: Large packet size {packet_size} bytes for type {packet_type}")
+        
+        return final_packet
 
     def verify_packet(self, packet_data):
         """Verify packet checksum"""
         try:
             data = json.loads(packet_data.decode())
-            checksum = data.pop('checksum', None)
-            if not checksum:
+            received_checksum = data.pop('checksum', None)
+            if not received_checksum:
+                self.log_and_print("Packet missing checksum field")
                 return False, None
 
-            packet_json = json.dumps(data, separators=(',', ':'))
+            # Calculate checksum with consistent ordering
+            packet_json = json.dumps(data, separators=(',', ':'), sort_keys=True)
             expected_checksum = hashlib.md5(packet_json.encode()).hexdigest()[:8]
 
-            if checksum == expected_checksum:
-                data['checksum'] = checksum  # Put it back
+            if received_checksum == expected_checksum:
+                data['checksum'] = received_checksum  # Put it back
                 return True, data
             else:
+                self.log_and_print(f"Checksum mismatch!")
+                self.log_and_print(f"  Received checksum: {received_checksum}")
+                self.log_and_print(f"  Expected checksum: {expected_checksum}")
+                self.log_and_print(f"  Packet JSON length: {len(packet_json)}")
+                self.log_and_print(f"  First 100 chars: {packet_json[:100]}")
                 return False, None
         except Exception as e:
+            self.log_and_print(f"Packet verification error: {e}")
             return False, None
 
     def send_packet(self, packet_data):
         """Send packet via LoRa using the proven method from test script"""
         try:
+            packet_size = len(packet_data)
+            if packet_size > 240:
+                self.log_and_print(f"WARNING: Packet size {packet_size} may exceed LoRa limits")
+            
             with self.ser_lock:
                 # Create LoRa frame exactly like the working test script
                 lora_frame = bytes([
@@ -1108,6 +1105,7 @@ def verify_packet(self, packet_data):
             self.log_and_print(f"Fatal error: {e}")
         finally:
             self.log_and_print(f"Application completed. Log saved to: {self.log_filename}")
+
 
 def main():
     parser = argparse.ArgumentParser(description='LoRa app for Storm3 data transmission')
