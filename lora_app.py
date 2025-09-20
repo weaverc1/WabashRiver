@@ -141,30 +141,134 @@ class LoRaNode:
         except Exception as e:
             self.log_and_print(f"Failed to persist state: {e}")
 
-    def _fetch_latest_csv(self) -> Tuple[Optional[int], Optional[str], Optional[str]]:
-        req = urllib.request.Request(CSV_URL, method="GET")
-        req.add_header("Accept", "text/csv, */*;q=0.1")
-        req.add_header("User-Agent", "storm3_tx/1.1")
-        req.add_header("Accept-Encoding", "gzip")
-        if self.if_modified_since:
-            req.add_header("If-Modified-Since", self.if_modified_since)
+    def _fetch_latest_csv_with_retry(self) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+        """
+        Fetch CSV with improved reliability:
+        - Multiple retry attempts with exponential backoff
+        - Longer timeouts for network issues
+        - Different retry strategies for different error types
+        """
+        max_retries = 3
+        base_delay = 2  # seconds
 
+        for attempt in range(max_retries + 1):
+            try:
+                # Increase timeout progressively
+                timeout = 6 + (attempt * 4)  # 6, 10, 14, 18 seconds
+
+                req = urllib.request.Request(CSV_URL, method="GET")
+                req.add_header("Accept", "text/csv, */*;q=0.1")
+                req.add_header("User-Agent", "storm3_tx/1.1")
+                req.add_header("Accept-Encoding", "gzip")
+                req.add_header("Connection", "close")  # Force connection close
+
+                if self.if_modified_since:
+                    req.add_header("If-Modified-Since", self.if_modified_since)
+
+                self.log_and_print(f"CSV fetch attempt {attempt + 1}/{max_retries + 1} (timeout: {timeout}s)")
+
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    status = resp.status
+                    data = resp.read()
+                    if resp.headers.get("Content-Encoding", "") == "gzip":
+                        data = gzip.decompress(data)
+                    last_mod = resp.headers.get("Last-Modified")
+
+                    self.log_and_print(f"CSV fetch successful on attempt {attempt + 1}")
+                    return status, data.decode("utf-8", errors="replace"), last_mod
+
+            except urllib.error.HTTPError as e:
+                if e.code == 304:
+                    return 304, None, None
+                elif e.code in [500, 502, 503, 504]:  # Server errors - retry
+                    self.log_and_print(f"HTTP server error {e.code} on attempt {attempt + 1}: {e.reason}")
+                    if attempt < max_retries:
+                        delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                        self.log_and_print(f"Retrying in {delay:.1f} seconds...")
+                        time.sleep(delay)
+                        continue
+                else:  # Client errors (4xx) - don't retry
+                    self.log_and_print(f"HTTP client error {e.code}: {e.reason}")
+                    return None, None, None
+
+            except urllib.error.URLError as e:
+                error_msg = str(e.reason)
+                self.log_and_print(f"URL error on attempt {attempt + 1}: {error_msg}")
+
+                # Check for specific network issues
+                if any(keyword in error_msg.lower() for keyword in
+                       ['network is unreachable', 'no route to host', 'connection refused']):
+                    # Network infrastructure issues - longer delay
+                    if attempt < max_retries:
+                        delay = base_delay * (3 ** attempt) + random.uniform(0, 2)  # More aggressive backoff
+                        self.log_and_print(f"Network issue detected, retrying in {delay:.1f} seconds...")
+                        time.sleep(delay)
+                        continue
+                elif 'timed out' in error_msg.lower():
+                    # Timeout issues - moderate delay
+                    if attempt < max_retries:
+                        delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                        self.log_and_print(f"Timeout detected, retrying in {delay:.1f} seconds...")
+                        time.sleep(delay)
+                        continue
+                else:
+                    # Other URL errors - short delay
+                    if attempt < max_retries:
+                        delay = base_delay + random.uniform(0, 1)
+                        self.log_and_print(f"Retrying in {delay:.1f} seconds...")
+                        time.sleep(delay)
+                        continue
+
+            except Exception as e:
+                self.log_and_print(f"Unexpected error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries:
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    self.log_and_print(f"Retrying in {delay:.1f} seconds...")
+                    time.sleep(delay)
+                    continue
+
+        self.log_and_print(f"CSV fetch failed after {max_retries + 1} attempts")
+        return None, None, None
+
+
+    def _fetch_latest_csv_with_fallback(self) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+        """
+        Enhanced CSV fetching with fallback mechanisms
+        """
+        # Primary method with retries
+        result = self._fetch_latest_csv_with_retry()
+        if result[0] is not None:  # Success or 304
+            return result
+
+        # Fallback: Try different approach if available
+        # Could add alternative endpoints, different protocols, etc.
+        self.log_and_print("Primary CSV fetch failed, trying fallback methods...")
+
+        # Example: Try without compression
         try:
-            with urllib.request.urlopen(req, timeout=6) as resp:
+            req = urllib.request.Request(CSV_URL, method="GET")
+            req.add_header("Accept", "text/csv")
+            req.add_header("User-Agent", "storm3_tx/1.1")
+            req.add_header("Connection", "close")
+            # Don't request gzip compression
+
+            if self.if_modified_since:
+                req.add_header("If-Modified-Since", self.if_modified_since)
+
+            self.log_and_print("Fallback: Trying without compression...")
+
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 status = resp.status
                 data = resp.read()
-                if resp.headers.get("Content-Encoding", "") == "gzip":
-                    data = gzip.decompress(data)
                 last_mod = resp.headers.get("Last-Modified")
+
+                self.log_and_print("Fallback CSV fetch successful")
                 return status, data.decode("utf-8", errors="replace"), last_mod
-        except urllib.error.HTTPError as e:
-            if e.code == 304:
-                return 304, None, None
-            self.log_and_print(f"HTTP error fetching CSV: {e.reason}")
-            return None, None, None
+
         except Exception as e:
-            self.log_and_print(f"HTTP error fetching CSV: {e}")
-            return None, None, None
+            self.log_and_print(f"Fallback CSV fetch also failed: {e}")
+
+        return None, None, None
 
     def _extract_latest_row(self, csv_text: str) -> Optional[Tuple[str, str, str, str]]:
         if not csv_text:
@@ -345,12 +449,16 @@ class LoRaNode:
             self.log_and_print(f"TX: Cleaned up old pending ACKs, now tracking {len(self.pending_acks)} entries")
 
     def transmitter_loop(self):
-        """Main transmitter loop - fetches Storm3 data and transmits via LoRa"""
+        """
+        Improved transmitter loop with better error handling and adaptive timing
+        """
         self.log_and_print("Starting transmitter mode - fetching and broadcasting Storm3 data every 15 minutes")
 
-        next_transmission = time.time()  # Start first transmission immediately
-        stats_log_interval = 86400  # Log stats every 24 hours
+        next_transmission = time.time()
+        stats_log_interval = 86400
         next_stats_log = time.time() + stats_log_interval
+        consecutive_failures = 0
+        max_consecutive_failures = 3
 
         while True:
             try:
@@ -364,20 +472,39 @@ class LoRaNode:
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
-                # Schedule the next transmission for 15 minutes from now
-                next_transmission += 900  # 15 minutes = 900 seconds
+                # Adaptive scheduling: increase interval after consecutive failures
+                base_interval = 900  # 15 minutes
+                if consecutive_failures >= max_consecutive_failures:
+                    # Back off to 30 minutes after multiple failures
+                    interval = base_interval * 2
+                    self.log_and_print(f"Using extended interval ({interval//60} min) due to consecutive failures")
+                else:
+                    interval = base_interval
 
-                # 1. Fetch data
-                status, text, last_mod = self._fetch_latest_csv()
+                next_transmission += interval
+
+                # Fetch data with improved reliability
+                status, text, last_mod = self._fetch_latest_csv_with_fallback()
 
                 if status == 304:
                     self.log_and_print("No new data (304 Not Modified), sleeping.")
-                    continue
-                if status != 200 or not text:
-                    self.log_and_print(f"Failed to fetch data (status: {status}), sleeping.")
+                    consecutive_failures = 0  # Reset counter on successful connection
                     continue
 
-                # 2. Extract latest row
+                if status != 200 or not text:
+                    consecutive_failures += 1
+                    self.log_and_print(f"Failed to fetch data (status: {status}), consecutive failures: {consecutive_failures}")
+
+                    # Early retry for first few failures
+                    if consecutive_failures <= 2:
+                        self.log_and_print("Scheduling early retry in 5 minutes...")
+                        next_transmission = time.time() + 300  # Retry in 5 minutes
+                    continue
+
+                # Success - reset failure counter
+                consecutive_failures = 0
+
+                # Continue with existing packet transmission logic...
                 row = self._extract_latest_row(text)
                 if not row:
                     self.log_and_print("Could not extract data row from CSV, sleeping.")
@@ -386,11 +513,12 @@ class LoRaNode:
                 csv_date, csv_time, riverstage, rain_gauge = row
                 self.log_and_print(f"Fetched new data: {csv_date} {csv_time}, River: {riverstage}, Rain: {rain_gauge}")
 
+                # [Rest of transmission logic remains the same]
                 # 3. Build and send packet
                 self.cleanup_pending_acks()
 
                 packet = self.create_packet(
-                    'STORM_DATA', 
+                    'STORM_DATA',
                     self.seq_number,
                     board_temp_c=self.get_cpu_temp(),
                     csv_date=csv_date,
@@ -452,6 +580,7 @@ class LoRaNode:
                 break
             except Exception as e:
                 self.log_and_print(f"Transmitter error: {e}")
+                consecutive_failures += 1
                 time.sleep(5)
 
     def receiver_loop(self):
