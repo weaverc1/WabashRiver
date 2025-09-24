@@ -107,7 +107,7 @@ class LoRaNode:
 
         self.node = sx126x.sx126x(
             serial_num="/dev/serial0",
-            freq=919,
+            freq=924,
             addr=self.addr,
             power=22,
             rssi=True,
@@ -433,7 +433,7 @@ class LoRaNode:
                 self.node.send(lora_frame)
 
                 # Small delay after sending to ensure transmission completes
-                time.sleep(0.6)
+                time.sleep(0.7)
                 return True
         except Exception as e:
             self.log_and_print(f"Error sending packet: {e}")
