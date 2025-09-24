@@ -111,7 +111,7 @@ class LoRaNode:
             addr=self.addr,
             power=22,
             rssi=True,
-            air_speed=300,
+            air_speed=1200,
             relay=False
         )
 
