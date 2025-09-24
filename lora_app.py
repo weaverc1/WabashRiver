@@ -107,11 +107,11 @@ class LoRaNode:
 
         self.node = sx126x.sx126x(
             serial_num="/dev/serial0",
-            freq=915,
+            freq=919,
             addr=self.addr,
             power=22,
             rssi=True,
-            air_speed=1200,
+            air_speed=2400,
             relay=False
         )
 
@@ -433,7 +433,7 @@ class LoRaNode:
                 self.node.send(lora_frame)
 
                 # Small delay after sending to ensure transmission completes
-                time.sleep(0.1)
+                time.sleep(0.6)
                 return True
         except Exception as e:
             self.log_and_print(f"Error sending packet: {e}")
@@ -537,14 +537,22 @@ class LoRaNode:
                     if retry_count > 0:
                         self.log_and_print(f"TX Seq#{self.seq_number}: Retry {retry_count}/{max_retries-1}")
 
-                    if self.send_packet(packet):
-                        self.log_and_print(f"TX Seq#{self.seq_number}: Packet sent, waiting for ACK...")
+                    # Send the packet twice, 300ms apart
+                    self.log_and_print(f"TX Seq#{self.seq_number}: Sending packet 1 of 2.")
+                    send1_ok = self.send_packet(packet)
+                    time.sleep(0.3)
+                    self.log_and_print(f"TX Seq#{self.seq_number}: Sending packet 2 of 2.")
+                    send2_ok = self.send_packet(packet)
+
+                    # Consider the transmission attempt successful if at least one packet went out.
+                    if send1_ok or send2_ok:
+                        self.log_and_print(f"TX Seq#{self.seq_number}: Packet sent (send1: {'OK' if send1_ok else 'FAIL'}, send2: {'OK' if send2_ok else 'FAIL'}), waiting for ACK...")
                         self.update_stats('packets_sent')
 
                         self.ack_received.clear()
                         self.pending_acks[self.seq_number] = retry_count
 
-                        if self.ack_received.wait(timeout=7):
+                        if self.ack_received.wait(timeout=15):
                             if self.seq_number not in self.pending_acks:
                                 self.log_and_print(f"TX Seq#{self.seq_number}: ACK received successfully")
                                 self.update_stats('acks_received')
@@ -554,7 +562,7 @@ class LoRaNode:
                         else:
                             self.log_and_print(f"TX Seq#{self.seq_number}: ACK timeout")
                     else:
-                        self.log_and_print(f"TX Seq#{self.seq_number}: Failed to send packet")
+                        self.log_and_print(f"TX Seq#{self.seq_number}: Failed to send both packets")
 
                     retry_count += 1
                     if not success and retry_count < max_retries:
