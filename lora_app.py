@@ -7,7 +7,7 @@ This script can run as a transmitter or a receiver using JSON packet format.
 
 Transmitter mode:
 - Fetches the latest data from a Storm3 device's CSV export.
-- Syncs to Storm3's actual write schedule for optimal fetch timing.
+- Calibrates clock offset between Pi and Storm3 for optimal timing.
 - Transmits the data using LoRa with JSON packets and ACK mechanism.
 - Maintains state to avoid re-transmitting old data.
 
@@ -148,6 +148,12 @@ class LoRaNode:
             self.seq_number = 1
             self.if_modified_since = None
             self._load_state()
+            
+            # Clock calibration tracking
+            self.clock_offset = None  # Seconds Storm3 is ahead of Pi (can be negative)
+            self.last_storm3_timestamp = None
+            self.last_pi_timestamp = None
+            self.calibration_confidence = 0  # Increments with each successful calibration
         else: # rx mode
             self.seq_number = 0
             self.csv_path = os.path.join(LOG_DIR, "rx_data.csv")
@@ -304,6 +310,76 @@ class LoRaNode:
                 avg_snr = sum(self.stats['snr_readings']) / len(self.stats['snr_readings'])
                 self.log_and_print(f"Average SNR: {avg_snr:.1f} dB")
 
+    def calibrate_clocks(self, storm3_timestamp):
+        """
+        Calibrate Pi clock relative to Storm3 clock
+        Returns True if calibration updated
+        """
+        pi_time = time.time()
+        
+        if self.last_storm3_timestamp is None:
+            # First data point - just record
+            self.last_storm3_timestamp = storm3_timestamp
+            self.last_pi_timestamp = pi_time
+            self.log_and_print("Clock calibration: first data point recorded")
+            return False
+        
+        # Calculate elapsed time on both clocks
+        storm3_elapsed = storm3_timestamp - self.last_storm3_timestamp
+        pi_elapsed = pi_time - self.last_pi_timestamp
+        
+        # Verify Storm3 elapsed time makes sense (should be ~15 min)
+        if 800 < storm3_elapsed < 1000:  # 13-17 minutes tolerance
+            # Calculate clock offset
+            self.clock_offset = storm3_timestamp - pi_time
+            self.calibration_confidence = min(self.calibration_confidence + 1, 10)
+            
+            offset_min = self.clock_offset / 60
+            self.log_and_print(f"Clock calibration updated: Storm3 is {offset_min:+.1f} min relative to Pi")
+            self.log_and_print(f"Storm3 elapsed: {storm3_elapsed:.1f}s, Pi elapsed: {pi_elapsed:.1f}s")
+            self.log_and_print(f"Calibration confidence: {self.calibration_confidence}/10")
+            
+            # Update tracking
+            self.last_storm3_timestamp = storm3_timestamp
+            self.last_pi_timestamp = pi_time
+            return True
+        else:
+            # Unexpected time gap - reset calibration
+            self.log_and_print(f"Unexpected Storm3 time gap: {storm3_elapsed:.1f}s, resetting calibration")
+            self.last_storm3_timestamp = storm3_timestamp
+            self.last_pi_timestamp = pi_time
+            self.calibration_confidence = 0
+            return False
+    
+    def calculate_next_fetch_time(self, current_storm3_timestamp):
+        """
+        Calculate when to fetch next, accounting for clock offset
+        """
+        if self.clock_offset is None or self.calibration_confidence < 2:
+            # Not calibrated yet - use simple relative timing
+            next_fetch = time.time() + (15 * 60) + 180
+            self.log_and_print("Not calibrated, using relative timing (18 min)")
+            return next_fetch
+        
+        # Predict Storm3's next write time
+        next_storm3_write = current_storm3_timestamp + 900  # +15 minutes
+        
+        # Convert to Pi time and add 3-minute buffer
+        next_fetch_pi_time = next_storm3_write - self.clock_offset + 180
+        
+        # Sanity check: shouldn't be more than 20 minutes away
+        time_until_fetch = next_fetch_pi_time - time.time()
+        if 0 < time_until_fetch < 1200:  # 0-20 minutes
+            next_storm3_dt = datetime.fromtimestamp(next_storm3_write)
+            next_storm3_str = next_storm3_dt.strftime('%H:%M:%S')
+            self.log_and_print(f"Calibrated timing: Storm3 writes at {next_storm3_str}, fetching 3min after")
+            return next_fetch_pi_time
+        else:
+            # Calibration seems off - fall back to relative
+            self.log_and_print(f"Calibration suspect (fetch in {time_until_fetch/60:.1f}min), using relative timing")
+            self.calibration_confidence = 0
+            return time.time() + (15 * 60) + 180
+
     def create_packet(self, packet_type, seq_num, **kwargs):
         """
         Create a JSON packet with CRC-16/MODBUS checksum
@@ -320,7 +396,7 @@ class LoRaNode:
             compact_ts = ""
         
         payload = {
-            't': packet_type,      # type
+            'type': packet_type,   # Use 'type' instead of 't' for clarity
             's': seq_num,          # sequence
             'T': kwargs.get('board_temp_c', 0.0),  # Temperature
         }
@@ -417,7 +493,7 @@ class LoRaNode:
         """
         Initialization routine on app startup:
         1. Announce we're alive to the receiver
-        2. Fetch current Storm3 data to sync schedule
+        2. Fetch current Storm3 data to start clock calibration
         3. Set up first transmission timing
         """
         boot_time = datetime.now()
@@ -439,7 +515,7 @@ class LoRaNode:
         time.sleep(0.3)
         self.send_packet(wakeup_packet)  # Send twice for reliability
         
-        # Try to fetch current Storm3 data to sync schedule
+        # Try to fetch current Storm3 data to start calibration
         self.log_and_print("Attempting initial Storm3 sync...")
         
         for attempt in range(3):  # Try 3 times on boot
@@ -457,15 +533,14 @@ class LoRaNode:
                     data_timestamp = parse_csv_timestamp(csv_date, csv_time)
                     
                     if data_timestamp:
-                        # Calculate next fetch: 15 min + 3 min buffer after the data timestamp
-                        next_fetch_time = data_timestamp + (15 * 60) + 180
+                        # Start clock calibration with first data point
+                        self.calibrate_clocks(data_timestamp)
                         
-                        # If that time is in the past, add 15 minutes
-                        while next_fetch_time < time.time():
-                            next_fetch_time += 900
+                        # Schedule first fetch using relative timing (not calibrated yet)
+                        next_fetch_time = time.time() + (15 * 60) + 180
                         
+                        self.log_and_print(f"Initial sync: last Storm3 data at {csv_date} {csv_time}")
                         next_fetch_dt = datetime.fromtimestamp(next_fetch_time)
-                        self.log_and_print(f"Synced to Storm3: last data at {csv_date} {csv_time}")
                         self.log_and_print(f"Next fetch scheduled for {next_fetch_dt.strftime('%Y-%m-%d %H:%M:%S')}")
                         self.log_and_print("=== INITIALIZATION COMPLETE ===")
                         return next_fetch_time
@@ -480,7 +555,7 @@ class LoRaNode:
         return fallback_time
 
     def transmitter_loop(self):
-        """Transmitter synced to Storm3 schedule with 3-minute safety buffer"""
+        """Transmitter with clock calibration for optimal timing"""
         
         # Run initialization routine
         next_fetch_time = self.initialize_on_boot()
@@ -523,17 +598,15 @@ class LoRaNode:
                 csv_date, csv_time, riverstage, rain_gauge = row
                 self.log_and_print(f"Fetched data: {csv_date} {csv_time}, River: {riverstage}, Rain: {rain_gauge}")
                 
-                # Parse the timestamp to sync our schedule
+                # Parse timestamp, calibrate clocks, and calculate next fetch time
                 data_timestamp = parse_csv_timestamp(csv_date, csv_time)
                 if data_timestamp:
-                    # Schedule next fetch: 15 minutes + 3 minutes buffer after THIS data point
-                    next_fetch_time = data_timestamp + (15 * 60) + 180
-                    next_data_time = datetime.fromtimestamp(data_timestamp + 900).strftime('%H:%M:%S')
-                    self.log_and_print(f"Synced to Storm3: next data at {next_data_time}, fetch 3min after")
+                    self.calibrate_clocks(data_timestamp)
+                    next_fetch_time = self.calculate_next_fetch_time(data_timestamp)
                 else:
-                    # Fallback: just wait 15 minutes
-                    next_fetch_time = time.time() + (15 * 60)
-                    self.log_and_print("Could not parse timestamp, using 15min interval")
+                    # Can't parse timestamp, use relative timing
+                    next_fetch_time = time.time() + (15 * 60) + 180
+                    self.log_and_print("Could not parse timestamp, using relative timing (18 min)")
                 
                 # Build and send packet
                 self.cleanup_pending_acks()
@@ -673,7 +746,7 @@ class LoRaNode:
                             self.update_stats('invalid_packets')
                             continue
 
-                        packet_type = packet_info.get('t', 'UNKNOWN')
+                        packet_type = packet_info.get('type', 'UNKNOWN')
                         
                         # Handle SYSTEM packets (boot announcement)
                         if packet_type == 'SYSTEM':
