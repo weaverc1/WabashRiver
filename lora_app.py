@@ -153,12 +153,6 @@ class LoRaNode:
             self.seq_number = 1
             self.if_modified_since = None
             self._load_state()
-            
-            # Clock calibration tracking
-            self.clock_offset = None
-            self.last_storm3_timestamp = None
-            self.last_pi_timestamp = None
-            self.calibration_confidence = 0
         else: # rx mode
             self.seq_number = 0
             self.csv_path = os.path.join(LOG_DIR, "rx_data.csv")
@@ -312,76 +306,6 @@ class LoRaNode:
                 avg_snr = sum(self.stats['snr_readings']) / len(self.stats['snr_readings'])
                 self.log_and_print(f"Average SNR: {avg_snr:.1f} dB")
 
-    def calibrate_clocks(self, storm3_timestamp):
-        """Calibrate Pi clock relative to Storm3 clock"""
-        pi_time = time.time()
-        
-        if self.last_storm3_timestamp is None:
-            self.last_storm3_timestamp = storm3_timestamp
-            self.last_pi_timestamp = pi_time
-            self.log_and_print("Clock calibration: first data point recorded")
-            return False
-        
-        storm3_elapsed = storm3_timestamp - self.last_storm3_timestamp
-        pi_elapsed = pi_time - self.last_pi_timestamp
-        
-        # Check if elapsed time is a multiple of 15 minutes (within tolerance)
-        # This handles cases where Storm3 skips data points (30min, 45min, etc.)
-        intervals = round(storm3_elapsed / 900)
-        expected_elapsed = intervals * 900
-        
-        # Accept if within ±100 seconds of expected interval(s)
-        if intervals > 0 and abs(storm3_elapsed - expected_elapsed) < 100:
-            self.clock_offset = storm3_timestamp - pi_time
-            
-            # Only increase confidence for single-interval updates
-            if intervals == 1:
-                self.calibration_confidence = min(self.calibration_confidence + 1, 10)
-            else:
-                self.log_and_print(f"Storm3 skipped {intervals-1} data point(s), maintaining calibration confidence")
-            
-            offset_min = self.clock_offset / 60
-            self.log_and_print(f"Clock calibration updated: Storm3 is {offset_min:+.1f} min relative to Pi")
-            self.log_and_print(f"Storm3 elapsed: {storm3_elapsed:.1f}s ({intervals} intervals), Pi elapsed: {pi_elapsed:.1f}s")
-            self.log_and_print(f"Calibration confidence: {self.calibration_confidence}/10")
-            
-            self.last_storm3_timestamp = storm3_timestamp
-            self.last_pi_timestamp = pi_time
-            return True
-        else:
-            self.log_and_print(f"Unexpected Storm3 time gap: {storm3_elapsed:.1f}s (not a multiple of 15min), resetting calibration")
-            self.last_storm3_timestamp = storm3_timestamp
-            self.last_pi_timestamp = pi_time
-            self.calibration_confidence = 0
-            return False
-    
-    def calculate_next_fetch_time(self, current_storm3_timestamp):
-        """Calculate when to fetch next, accounting for clock offset"""
-        if self.clock_offset is None or self.calibration_confidence < 2:
-            # Not calibrated yet - use Storm3's 15-minute interval
-            next_fetch = time.time() + (15 * 60)
-            self.log_and_print("Not calibrated, using 15-minute interval")
-            return next_fetch
-        
-        # Predict Storm3's next write time
-        next_storm3_write = current_storm3_timestamp + 900
-        
-        # Convert to Pi time and add 3-minute buffer
-        next_fetch_pi_time = next_storm3_write - self.clock_offset + 180
-        
-        # Sanity check: shouldn't be more than 20 minutes away
-        time_until_fetch = next_fetch_pi_time - time.time()
-        if 0 < time_until_fetch < 1200:
-            next_storm3_dt = datetime.fromtimestamp(next_storm3_write)
-            next_storm3_str = next_storm3_dt.strftime('%H:%M:%S')
-            self.log_and_print(f"Calibrated timing: Storm3 writes at {next_storm3_str}, fetching 3min after")
-            return next_fetch_pi_time
-        else:
-            # Calibration seems off - fall back to 15-minute interval
-            self.log_and_print(f"Calibration suspect (fetch in {time_until_fetch/60:.1f}min), using 15-minute interval")
-            self.calibration_confidence = 0
-            return time.time() + (15 * 60)
-
     def create_packet(self, packet_type, seq_num, **kwargs):
         """Create a JSON packet with CRC-16/MODBUS checksum"""
         # Compact timestamp format: YYMMDDHHMM (10 chars vs 19)
@@ -518,46 +442,15 @@ class LoRaNode:
         time.sleep(0.3)
         self.send_packet(wakeup_packet)
         
-        self.log_and_print("Attempting initial Storm3 sync...")
-        
-        for attempt in range(3):
-            if not check_storm3_tcp_alive(timeout=3):
-                self.log_and_print(f"Storm3 TCP not responding (attempt {attempt + 1}/3)")
-                time.sleep(10)
-                continue
-            
-            status, csv_text, last_mod = self._fetch_latest_csv_with_retry()
-            
-            if status and csv_text:
-                row = self._extract_latest_row(csv_text)
-                if row:
-                    csv_date, csv_time, riverstage, rain_gauge = row
-                    data_timestamp = parse_csv_timestamp(csv_date, csv_time)
-                    
-                    if data_timestamp:
-                        # Start clock calibration with first data point
-                        self.calibrate_clocks(data_timestamp)
-                        
-                        # Schedule first fetch using 15-minute interval (not calibrated yet)
-                        next_fetch_time = time.time() + (15 * 60)
-                        
-                        self.log_and_print(f"Initial sync: last Storm3 data at {csv_date} {csv_time}")
-                        next_fetch_dt = datetime.fromtimestamp(next_fetch_time)
-                        self.log_and_print(f"Next fetch scheduled for {next_fetch_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                        self.log_and_print("=== INITIALIZATION COMPLETE ===")
-                        return next_fetch_time
-            
-            self.log_and_print(f"Sync attempt {attempt + 1}/3 failed, retrying in 10s...")
-            time.sleep(10)
-        
-        # If all sync attempts failed, schedule fetch for 15 minutes from now
-        fallback_time = time.time() + (15 * 60)
-        self.log_and_print("Could not sync to Storm3, will try first fetch in 15 minutes")
-        self.log_and_print("=== INITIALIZATION COMPLETE (FALLBACK MODE) ===")
-        return fallback_time
+        # Simple approach: just fetch in 15 minutes
+        next_fetch_time = time.time() + (15 * 60)
+        next_fetch_dt = datetime.fromtimestamp(next_fetch_time)
+        self.log_and_print(f"First fetch scheduled for {next_fetch_dt.strftime('%Y-%m-%d %H:%M:%S')} (15 min from now)")
+        self.log_and_print("=== INITIALIZATION COMPLETE ===")
+        return next_fetch_time
 
     def transmitter_loop(self):
-        """Transmitter with clock calibration for optimal timing"""
+        """Transmitter - simple 15-minute polling"""
         next_fetch_time = self.initialize_on_boot()
         consecutive_failures = 0
         
@@ -593,14 +486,8 @@ class LoRaNode:
                 csv_date, csv_time, riverstage, rain_gauge = row
                 self.log_and_print(f"Fetched data: {csv_date} {csv_time}, River: {riverstage}, Rain: {rain_gauge}")
                 
-                data_timestamp = parse_csv_timestamp(csv_date, csv_time)
-                if data_timestamp:
-                    self.calibrate_clocks(data_timestamp)
-                    next_fetch_time = self.calculate_next_fetch_time(data_timestamp)
-                else:
-                    # Can't parse timestamp, use 15-minute interval
-                    next_fetch_time = time.time() + (15 * 60)
-                    self.log_and_print("Could not parse timestamp, using 15-minute interval")
+                # SIMPLE: Always schedule next fetch for 15 minutes from now
+                next_fetch_time = time.time() + (15 * 60)
                 
                 self.cleanup_pending_acks()
                 packet = self.create_packet(
