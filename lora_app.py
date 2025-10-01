@@ -674,7 +674,20 @@ class LoRaNode:
 
                 with self.ser_lock:
                     if self.node.ser.inWaiting() > 0:
-                        time.sleep(0.2)
+                        time.sleep(0.2)  # Allow full packet to arrive
+                        
+                        # Get RSSI immediately while packet is fresh in module
+                        packet_rssi = None
+                        noise_rssi = None
+                        snr = None
+                        try:
+                            packet_rssi = self.node.get_rssi()
+                            noise_rssi = self.get_noise_rssi()
+                            if packet_rssi is not None and noise_rssi is not None:
+                                snr = packet_rssi - noise_rssi
+                        except:
+                            pass
+                        
                         bytes_available = self.node.ser.inWaiting()
                         if bytes_available > 0:
                             raw_data = self.node.ser.read(bytes_available)
@@ -689,20 +702,11 @@ class LoRaNode:
                     src_freq = raw_data[2]
                     packet_data = raw_data[3:]
 
-                    packet_rssi = None
-                    noise_rssi = None
-                    snr = None
-                    
-                    try:
-                        packet_rssi = self.node.get_rssi()
-                        noise_rssi = self.get_noise_rssi()
-                        if packet_rssi is not None and noise_rssi is not None:
-                            snr = packet_rssi - noise_rssi
-                            self.update_stats('rssi_readings', packet_rssi)
-                            self.update_stats('snr_readings', snr)
-                            self.update_stats('noise_readings', noise_rssi)
-                    except:
-                        pass
+                    # Update stats if we got valid RSSI readings
+                    if packet_rssi is not None and noise_rssi is not None and snr is not None:
+                        self.update_stats('rssi_readings', packet_rssi)
+                        self.update_stats('snr_readings', snr)
+                        self.update_stats('noise_readings', noise_rssi)
 
                     freq_mhz = 850 + src_freq
                     self.log_and_print(f"RX: Received from addr {src_addr} at {freq_mhz}.125MHz")
