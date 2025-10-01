@@ -142,6 +142,15 @@ class LoRaNode:
 
         self.log_lock = Lock()
         self.log_filename = os.path.join(LOG_DIR, f"lora_{mode}.log")
+        
+        # Ensure log file exists with proper permissions
+        try:
+            if not os.path.exists(self.log_filename):
+                with open(self.log_filename, 'w') as f:
+                    f.write(f"# LoRa {mode.upper()} Log - Started {datetime.now().isoformat()}\n")
+            print(f"Logging to: {self.log_filename}")
+        except Exception as e:
+            print(f"Warning: Could not create log file {self.log_filename}: {e}")
 
         # TX-specific state
         if self.mode == 'tx':
@@ -415,8 +424,8 @@ class LoRaNode:
         # Calculate checksum
         checksum = crc16_modbus(payload_bytes)
         
-        # Append checksum - FIX: Only add ONE closing brace
-        packet_with_checksum = payload_json[:-1] + f',"c":"{checksum}"}' # REMOVED EXTRA }
+        # Append checksum - FIXED: Only add ONE closing brace
+        packet_with_checksum = payload_json[:-1] + f',"c":"{checksum}"}}' 
         
         return packet_with_checksum.encode('utf-8')
 
