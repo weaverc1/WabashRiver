@@ -676,21 +676,21 @@ class LoRaNode:
                     if self.node.ser.inWaiting() > 0:
                         time.sleep(0.2)  # Allow full packet to arrive
                         
-                        # Get RSSI immediately while packet is fresh in module
-                        packet_rssi = None
-                        noise_rssi = None
-                        snr = None
-                        try:
-                            packet_rssi = self.node.get_rssi()
-                            noise_rssi = self.get_noise_rssi()
-                            if packet_rssi is not None and noise_rssi is not None:
-                                snr = packet_rssi - noise_rssi
-                        except:
-                            pass
-                        
                         bytes_available = self.node.ser.inWaiting()
                         if bytes_available > 0:
                             raw_data = self.node.ser.read(bytes_available)
+                            
+                            # Get RSSI immediately after reading packet
+                            packet_rssi = None
+                            noise_rssi = None
+                            snr = None
+                            try:
+                                packet_rssi = self.node.get_rssi()
+                                noise_rssi = self.get_noise_rssi()
+                                if packet_rssi is not None and noise_rssi is not None:
+                                    snr = packet_rssi - noise_rssi
+                            except:
+                                pass
                         else:
                             continue
                     else:
