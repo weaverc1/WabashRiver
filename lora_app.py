@@ -367,6 +367,7 @@ class LoRaNode:
 
     def create_packet(self, packet_type, seq_num, **kwargs):
         """Create a JSON packet with CRC-16/MODBUS checksum"""
+        # Compact timestamp format: YYMMDDHHMM (10 chars vs 19)
         if 'csv_date' in kwargs and 'csv_time' in kwargs:
             try:
                 dt = datetime.strptime(f"{kwargs['csv_date']} {kwargs['csv_time']}", "%m/%d/%Y %H:%M:%S")
@@ -382,10 +383,14 @@ class LoRaNode:
             'T': kwargs.get('board_temp_c', 0.0),
         }
         
+        # Add timestamp if available (for both SYSTEM and STORM_DATA)
+        if compact_ts:
+            payload['t'] = compact_ts
+        
+        # Add data fields for STORM_DATA packets
         if packet_type == 'STORM_DATA':
             payload.update({
-                't': compact_ts,                    
-                'd': kwargs.get('riverstage', ''),  
+                'd': kwargs.get('riverstage', ''),
                 'r': kwargs.get('rain_gauge', '')   
             })
         
@@ -397,21 +402,15 @@ class LoRaNode:
         # Add checksum - the }} in f-string becomes single } in output
         packet_with_checksum = payload_json[:-1] + f',"c":"{checksum}"}}'
         
-        # DEBUG logging - show both string and encoded bytes
-        packet_bytes = packet_with_checksum.encode('utf-8')
-        self.log_and_print(f"DEBUG TX STRING: len={len(packet_with_checksum)}, str={packet_with_checksum}")
-        self.log_and_print(f"DEBUG TX BYTES: len={len(packet_bytes)}, hex={packet_bytes.hex()}")
-        
-        return packet_bytes
+        return packet_with_checksum.encode('utf-8')
 
     def verify_packet(self, packet_data):
         """Verify packet integrity using CRC-16/MODBUS checksum"""
         try:
-            # Strategy: Try to decode and if we get replacement characters, trim back to last }
-            # First attempt: decode with replacement
+            # Strategy: decode with replacement to check for garbage bytes
             packet_str = packet_data.decode('utf-8', errors='replace')
             
-            # Check if there are replacement characters
+            # Check if there are replacement characters (garbage bytes)
             if '�' in packet_str:
                 # Find the last } before any replacement characters
                 last_brace = packet_data.rfind(b'}')
