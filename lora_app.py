@@ -424,8 +424,8 @@ class LoRaNode:
         # Calculate checksum
         checksum = crc16_modbus(payload_bytes)
         
-        # Append checksum - FIXED: Only add ONE closing brace
-        packet_with_checksum = payload_json[:-1] + f',"c":"{checksum}"}}' 
+        # Append checksum - ACTUALLY FIXED NOW: Only ONE closing brace
+        packet_with_checksum = payload_json[:-1] + f',"c":"{checksum}"}'
         
         return packet_with_checksum.encode('utf-8')
 
