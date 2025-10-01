@@ -424,11 +424,15 @@ class LoRaNode:
         # Calculate checksum
         checksum = crc16_modbus(payload_bytes)
         
-        # Append checksum - ACTUALLY FIXED NOW: Only ONE closing brace
-        packet_with_checksum = payload_json[:-1] + f',"c":"{checksum}"}'
+        # Append checksum
+        packet_with_checksum = payload_json[:-1] + f',"c":"{checksum}"}}'
+        
+        # DEBUG: Log what we're sending
+        self.log_and_print(f"DEBUG: Packet JSON: {packet_with_checksum}")
         
         return packet_with_checksum.encode('utf-8')
 
+  
     def verify_packet(self, packet_data):
         """
         Verify packet integrity using CRC-16/MODBUS checksum
