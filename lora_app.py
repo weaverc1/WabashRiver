@@ -325,20 +325,31 @@ class LoRaNode:
         storm3_elapsed = storm3_timestamp - self.last_storm3_timestamp
         pi_elapsed = pi_time - self.last_pi_timestamp
         
-        if 800 < storm3_elapsed < 1000:
+        # Check if elapsed time is a multiple of 15 minutes (within tolerance)
+        # This handles cases where Storm3 skips data points (30min, 45min, etc.)
+        intervals = round(storm3_elapsed / 900)
+        expected_elapsed = intervals * 900
+        
+        # Accept if within ±100 seconds of expected interval(s)
+        if intervals > 0 and abs(storm3_elapsed - expected_elapsed) < 100:
             self.clock_offset = storm3_timestamp - pi_time
-            self.calibration_confidence = min(self.calibration_confidence + 1, 10)
+            
+            # Only increase confidence for single-interval updates
+            if intervals == 1:
+                self.calibration_confidence = min(self.calibration_confidence + 1, 10)
+            else:
+                self.log_and_print(f"Storm3 skipped {intervals-1} data point(s), maintaining calibration confidence")
             
             offset_min = self.clock_offset / 60
             self.log_and_print(f"Clock calibration updated: Storm3 is {offset_min:+.1f} min relative to Pi")
-            self.log_and_print(f"Storm3 elapsed: {storm3_elapsed:.1f}s, Pi elapsed: {pi_elapsed:.1f}s")
+            self.log_and_print(f"Storm3 elapsed: {storm3_elapsed:.1f}s ({intervals} intervals), Pi elapsed: {pi_elapsed:.1f}s")
             self.log_and_print(f"Calibration confidence: {self.calibration_confidence}/10")
             
             self.last_storm3_timestamp = storm3_timestamp
             self.last_pi_timestamp = pi_time
             return True
         else:
-            self.log_and_print(f"Unexpected Storm3 time gap: {storm3_elapsed:.1f}s, resetting calibration")
+            self.log_and_print(f"Unexpected Storm3 time gap: {storm3_elapsed:.1f}s (not a multiple of 15min), resetting calibration")
             self.last_storm3_timestamp = storm3_timestamp
             self.last_pi_timestamp = pi_time
             self.calibration_confidence = 0
