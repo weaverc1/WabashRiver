@@ -47,7 +47,6 @@ from threading import Timer, Lock, Event
 # ---------------------------
 # CRC-16/MODBUS calculation
 # ---------------------------
-# Using a pre-calculated table for efficiency, as recommended.
 CRC16_MODBUS_TABLE = [
     0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
     0xC601, 0x06C0, 0x0780, 0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440,
@@ -88,10 +87,9 @@ def crc16_modbus(data: bytes) -> str:
     Compute CRC-16/MODBUS on 'data' (a bytes object).
     Returns a 4-character uppercase hexadecimal string.
     """
-    crc = 0xFFFF  # Initial value for MODBUS
+    crc = 0xFFFF
     for byte in data:
         crc = (crc >> 8) ^ CRC16_MODBUS_TABLE[(crc ^ byte) & 0xFF]
-    # Return as 4-char hex string (e.g., "7F3C")
     return f"{crc:04X}"
 
 # ---------------------------
@@ -104,9 +102,7 @@ CSV_URL    = f"http://{STORM_HOST}/data/{SITE_ID}.csv"
 # ---------------------------
 # Paths & logging
 # ---------------------------
-
 BASE_DIR  = os.path.expanduser("~/storm")
-
 LOG_DIR   = os.path.join(BASE_DIR, "logs")
 STATE_DIR = os.path.join(BASE_DIR, "state")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -159,10 +155,10 @@ class LoRaNode:
             self._load_state()
             
             # Clock calibration tracking
-            self.clock_offset = None  # Seconds Storm3 is ahead of Pi (can be negative)
+            self.clock_offset = None
             self.last_storm3_timestamp = None
             self.last_pi_timestamp = None
-            self.calibration_confidence = 0  # Increments with each successful calibration
+            self.calibration_confidence = 0
         else: # rx mode
             self.seq_number = 0
             self.csv_path = os.path.join(LOG_DIR, "rx_data.csv")
@@ -229,13 +225,10 @@ class LoRaNode:
             self.log_and_print(f"Failed to persist state: {e}")
 
     def _fetch_latest_csv_with_retry(self) -> Tuple[Optional[int], Optional[str], Optional[str]]:
-        """
-        Simplified fetch: one long attempt with minimal headers
-        """
+        """Simplified fetch: one long attempt with minimal headers"""
         try:
             req = urllib.request.Request(CSV_URL, method="GET")
             req.add_header("User-Agent", "Mozilla/5.0")
-            # Minimal headers for old Apache server
             
             self.log_and_print("Fetching CSV (timeout: 40s)")
             
@@ -320,26 +313,19 @@ class LoRaNode:
                 self.log_and_print(f"Average SNR: {avg_snr:.1f} dB")
 
     def calibrate_clocks(self, storm3_timestamp):
-        """
-        Calibrate Pi clock relative to Storm3 clock
-        Returns True if calibration updated
-        """
+        """Calibrate Pi clock relative to Storm3 clock"""
         pi_time = time.time()
         
         if self.last_storm3_timestamp is None:
-            # First data point - just record
             self.last_storm3_timestamp = storm3_timestamp
             self.last_pi_timestamp = pi_time
             self.log_and_print("Clock calibration: first data point recorded")
             return False
         
-        # Calculate elapsed time on both clocks
         storm3_elapsed = storm3_timestamp - self.last_storm3_timestamp
         pi_elapsed = pi_time - self.last_pi_timestamp
         
-        # Verify Storm3 elapsed time makes sense (should be ~15 min)
-        if 800 < storm3_elapsed < 1000:  # 13-17 minutes tolerance
-            # Calculate clock offset
+        if 800 < storm3_elapsed < 1000:
             self.clock_offset = storm3_timestamp - pi_time
             self.calibration_confidence = min(self.calibration_confidence + 1, 10)
             
@@ -348,12 +334,10 @@ class LoRaNode:
             self.log_and_print(f"Storm3 elapsed: {storm3_elapsed:.1f}s, Pi elapsed: {pi_elapsed:.1f}s")
             self.log_and_print(f"Calibration confidence: {self.calibration_confidence}/10")
             
-            # Update tracking
             self.last_storm3_timestamp = storm3_timestamp
             self.last_pi_timestamp = pi_time
             return True
         else:
-            # Unexpected time gap - reset calibration
             self.log_and_print(f"Unexpected Storm3 time gap: {storm3_elapsed:.1f}s, resetting calibration")
             self.last_storm3_timestamp = storm3_timestamp
             self.last_pi_timestamp = pi_time
@@ -361,40 +345,28 @@ class LoRaNode:
             return False
     
     def calculate_next_fetch_time(self, current_storm3_timestamp):
-        """
-        Calculate when to fetch next, accounting for clock offset
-        """
+        """Calculate when to fetch next, accounting for clock offset"""
         if self.clock_offset is None or self.calibration_confidence < 2:
-            # Not calibrated yet - use simple relative timing
             next_fetch = time.time() + (15 * 60) + 180
             self.log_and_print("Not calibrated, using relative timing (18 min)")
             return next_fetch
         
-        # Predict Storm3's next write time
-        next_storm3_write = current_storm3_timestamp + 900  # +15 minutes
-        
-        # Convert to Pi time and add 3-minute buffer
+        next_storm3_write = current_storm3_timestamp + 900
         next_fetch_pi_time = next_storm3_write - self.clock_offset + 180
         
-        # Sanity check: shouldn't be more than 20 minutes away
         time_until_fetch = next_fetch_pi_time - time.time()
-        if 0 < time_until_fetch < 1200:  # 0-20 minutes
+        if 0 < time_until_fetch < 1200:
             next_storm3_dt = datetime.fromtimestamp(next_storm3_write)
             next_storm3_str = next_storm3_dt.strftime('%H:%M:%S')
             self.log_and_print(f"Calibrated timing: Storm3 writes at {next_storm3_str}, fetching 3min after")
             return next_fetch_pi_time
         else:
-            # Calibration seems off - fall back to relative
             self.log_and_print(f"Calibration suspect (fetch in {time_until_fetch/60:.1f}min), using relative timing")
             self.calibration_confidence = 0
             return time.time() + (15 * 60) + 180
 
     def create_packet(self, packet_type, seq_num, **kwargs):
-        """
-        Create a JSON packet with CRC-16/MODBUS checksum
-        Uses shortened keys for compact transmission
-        """
-        # Compact timestamp format: YYMMDDHHMM (10 chars vs 19)
+        """Create a JSON packet with CRC-16/MODBUS checksum"""
         if 'csv_date' in kwargs and 'csv_time' in kwargs:
             try:
                 dt = datetime.strptime(f"{kwargs['csv_date']} {kwargs['csv_time']}", "%m/%d/%Y %H:%M:%S")
@@ -417,29 +389,28 @@ class LoRaNode:
                 'r': kwargs.get('rain_gauge', '')   
             })
         
-        # Serialize to JSON
         payload_json = json.dumps(payload, separators=(',', ':'))
         payload_bytes = payload_json.encode('utf-8')
         
-        # Calculate checksum
         checksum = crc16_modbus(payload_bytes)
         
-        # Append checksum
+        # Add checksum - the }} in f-string becomes single } in output
         packet_with_checksum = payload_json[:-1] + f',"c":"{checksum}"}}'
         
-        # DEBUG: Log what we're sending
-        self.log_and_print(f"DEBUG: Packet JSON: {packet_with_checksum}")
+        # DEBUG logging
+        self.log_and_print(f"DEBUG TX: len={len(packet_with_checksum)}, JSON={packet_with_checksum}")
         
         return packet_with_checksum.encode('utf-8')
 
-  
     def verify_packet(self, packet_data):
-        """
-        Verify packet integrity using CRC-16/MODBUS checksum
-        Returns (valid, packet_dict)
-        """
+        """Verify packet integrity using CRC-16/MODBUS checksum"""
         try:
             packet_str = packet_data.decode('utf-8', errors='replace')
+            
+            # DEBUG logging
+            self.log_and_print(f"DEBUG RX: len={len(packet_str)}, JSON={packet_str}")
+            self.log_and_print(f"DEBUG RX: bytes={packet_str.encode('utf-8').hex()}")
+            
             packet_info = json.loads(packet_str)
             
             if 'c' not in packet_info:
@@ -448,7 +419,6 @@ class LoRaNode:
             
             received_checksum = packet_info.pop('c')
             
-            # Recalculate checksum on payload without checksum field
             payload_for_check = json.dumps(packet_info, separators=(',', ':')).encode('utf-8')
             expected_checksum = crc16_modbus(payload_for_check)
             
@@ -459,34 +429,31 @@ class LoRaNode:
             return True, packet_info
             
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            self.log_and_print(f"RX: Packet failed verification: could not decode JSON. Error: {e}")
+            self.log_and_print(f"RX: Packet failed verification: {e}")
             return False, None
         except Exception as e:
-            self.log_and_print(f"RX: An unexpected error occurred during packet verification: {e}")
+            self.log_and_print(f"RX: Verification error: {e}")
             return False, None
 
     def send_packet(self, packet_data):
-        """Send packet via LoRa using the proven method from test script"""
+        """Send packet via LoRa"""
         try:
             with self.ser_lock:
-                # Create LoRa frame exactly like the working test script
                 lora_frame = bytes([
-                    self.target_addr >> 8,      # Target address high byte
-                    self.target_addr & 0xff,    # Target address low byte  
-                    self.node.offset_freq,      # Target frequency offset
-                    self.addr >> 8,             # Source address high byte
-                    self.addr & 0xff,           # Source address low byte
-                    self.node.offset_freq,      # Source frequency offset
+                    self.target_addr >> 8,
+                    self.target_addr & 0xff,
+                    self.node.offset_freq,
+                    self.addr >> 8,
+                    self.addr & 0xff,
+                    self.node.offset_freq,
                 ]) + packet_data
 
-                # Clear any pending data before sending
                 self.node.ser.flushInput()
                 self.node.ser.flushOutput()
-                time.sleep(0.1)  # Allow module to settle
+                time.sleep(0.1)
 
                 self.node.send(lora_frame)
 
-                # Small delay after sending to ensure transmission completes
                 time.sleep(0.7)
                 return True
         except Exception as e:
@@ -496,26 +463,19 @@ class LoRaNode:
     def cleanup_pending_acks(self):
         """Remove old pending ACKs to prevent memory growth"""
         if len(self.pending_acks) > self.max_pending_acks:
-            # Remove oldest entries (lowest sequence numbers)
             sorted_keys = sorted(self.pending_acks.keys())
             for key in sorted_keys[:len(self.pending_acks) - self.max_pending_acks + 20]:
                 self.pending_acks.pop(key, None)
             self.log_and_print(f"TX: Cleaned up old pending ACKs, now tracking {len(self.pending_acks)} entries")
 
     def initialize_on_boot(self):
-        """
-        Initialization routine on app startup:
-        1. Announce we're alive to the receiver
-        2. Fetch current Storm3 data to start clock calibration
-        3. Set up first transmission timing
-        """
+        """Initialization routine on app startup"""
         boot_time = datetime.now()
         self.log_and_print(f"=== BOOT INITIALIZATION at {boot_time.strftime('%Y-%m-%d %H:%M:%S')} ===")
         
-        # Send wake-up announcement packet to receiver
         wakeup_packet = self.create_packet(
             'SYSTEM',
-            0,  # Special seq number for system messages
+            0,
             board_temp_c=self.get_cpu_temp(),
             csv_date=boot_time.strftime("%m/%d/%Y"),
             csv_time=boot_time.strftime("%H:%M:%S"),
@@ -526,12 +486,11 @@ class LoRaNode:
         self.log_and_print("Sending wake-up announcement to receiver...")
         self.send_packet(wakeup_packet)
         time.sleep(0.3)
-        self.send_packet(wakeup_packet)  # Send twice for reliability
+        self.send_packet(wakeup_packet)
         
-        # Try to fetch current Storm3 data to start calibration
         self.log_and_print("Attempting initial Storm3 sync...")
         
-        for attempt in range(3):  # Try 3 times on boot
+        for attempt in range(3):
             if not check_storm3_tcp_alive(timeout=3):
                 self.log_and_print(f"Storm3 TCP not responding (attempt {attempt + 1}/3)")
                 time.sleep(10)
@@ -546,10 +505,7 @@ class LoRaNode:
                     data_timestamp = parse_csv_timestamp(csv_date, csv_time)
                     
                     if data_timestamp:
-                        # Start clock calibration with first data point
                         self.calibrate_clocks(data_timestamp)
-                        
-                        # Schedule first fetch using relative timing (not calibrated yet)
                         next_fetch_time = time.time() + (15 * 60) + 180
                         
                         self.log_and_print(f"Initial sync: last Storm3 data at {csv_date} {csv_time}")
@@ -561,7 +517,6 @@ class LoRaNode:
             self.log_and_print(f"Sync attempt {attempt + 1}/3 failed, retrying in 10s...")
             time.sleep(10)
         
-        # If all sync attempts failed, schedule fetch for 3 minutes from now
         fallback_time = time.time() + 180
         self.log_and_print("Could not sync to Storm3, will try first fetch in 3 minutes")
         self.log_and_print("=== INITIALIZATION COMPLETE (FALLBACK MODE) ===")
@@ -569,29 +524,23 @@ class LoRaNode:
 
     def transmitter_loop(self):
         """Transmitter with clock calibration for optimal timing"""
-        
-        # Run initialization routine
         next_fetch_time = self.initialize_on_boot()
-        
         consecutive_failures = 0
         
         while True:
             try:
-                # Wait until it's time to fetch
                 sleep_time = next_fetch_time - time.time()
                 if sleep_time > 0:
                     next_fetch_dt = datetime.fromtimestamp(next_fetch_time)
                     self.log_and_print(f"Next fetch at {next_fetch_dt.strftime('%Y-%m-%d %H:%M:%S')} (in {sleep_time:.0f}s)")
                     time.sleep(sleep_time)
                 
-                # TCP health check
                 if not check_storm3_tcp_alive(timeout=3):
                     self.log_and_print("Storm3 not responding to TCP, will retry in 60s")
                     next_fetch_time = time.time() + 60
                     consecutive_failures += 1
                     continue
                 
-                # Fetch CSV
                 status, csv_text, last_mod = self._fetch_latest_csv_with_retry()
                 
                 if status is None:
@@ -600,7 +549,6 @@ class LoRaNode:
                     consecutive_failures += 1
                     continue
                 
-                # Extract latest row
                 row = self._extract_latest_row(csv_text)
                 if not row:
                     self.log_and_print("No valid data in CSV, will retry in 60s")
@@ -611,17 +559,14 @@ class LoRaNode:
                 csv_date, csv_time, riverstage, rain_gauge = row
                 self.log_and_print(f"Fetched data: {csv_date} {csv_time}, River: {riverstage}, Rain: {rain_gauge}")
                 
-                # Parse timestamp, calibrate clocks, and calculate next fetch time
                 data_timestamp = parse_csv_timestamp(csv_date, csv_time)
                 if data_timestamp:
                     self.calibrate_clocks(data_timestamp)
                     next_fetch_time = self.calculate_next_fetch_time(data_timestamp)
                 else:
-                    # Can't parse timestamp, use relative timing
                     next_fetch_time = time.time() + (15 * 60) + 180
                     self.log_and_print("Could not parse timestamp, using relative timing (18 min)")
                 
-                # Build and send packet
                 self.cleanup_pending_acks()
                 packet = self.create_packet(
                     'STORM_DATA',
@@ -635,7 +580,6 @@ class LoRaNode:
                 
                 self.log_and_print(f"TX Seq#{self.seq_number}: Sending Storm3 data packet")
                 
-                # Transmission with retries
                 success = False
                 retry_count = 0
                 max_retries = 3
@@ -668,7 +612,6 @@ class LoRaNode:
                     if not success and retry_count < max_retries:
                         time.sleep(3)
                 
-                # Update state
                 if success:
                     self.log_and_print(f"TX Seq#{self.seq_number}: Successfully transmitted")
                     if last_mod:
@@ -693,23 +636,21 @@ class LoRaNode:
                 consecutive_failures += 1
 
     def receiver_loop(self):
-        """Main receiver loop using proven method from test script"""
+        """Main receiver loop"""
         self.log_and_print("Starting receiver mode - listening for JSON packets")
 
-        stats_log_interval = 86400  # Log stats every 24 hours
+        stats_log_interval = 86400
         next_stats_log = time.time() + stats_log_interval
 
         while True:
             try:
-                # Log statistics periodically
                 if time.time() >= next_stats_log:
                     self.log_statistics()
                     next_stats_log = time.time() + stats_log_interval
 
-                # Check for incoming packets (same method as working test script)
                 with self.ser_lock:
                     if self.node.ser.inWaiting() > 0:
-                        time.sleep(0.2)  # Allow full packet to arrive and settle
+                        time.sleep(0.2)
                         bytes_available = self.node.ser.inWaiting()
                         if bytes_available > 0:
                             raw_data = self.node.ser.read(bytes_available)
@@ -719,13 +660,11 @@ class LoRaNode:
                         time.sleep(0.2)
                         continue
 
-                if len(raw_data) > 3:  # Minimum frame size
-                    # Parse LoRa frame as received: [src_addr_h, src_addr_l, src_freq, payload...]
+                if len(raw_data) > 3:
                     src_addr = (raw_data[0] << 8) | raw_data[1]
                     src_freq = raw_data[2]
                     packet_data = raw_data[3:]
 
-                    # Get RSSI and SNR
                     packet_rssi = None
                     noise_rssi = None
                     snr = None
@@ -749,7 +688,6 @@ class LoRaNode:
                         snr_str = f"{snr:.1f}dB" if snr is not None else "N/A"
                         self.log_and_print(f"RX: Packet RSSI: {packet_rssi}dBm, Noise: {noise_str}, SNR: {snr_str}")
 
-                    # Verify and process packet
                     valid, packet_info = self.verify_packet(packet_data)
 
                     if valid:
@@ -761,7 +699,6 @@ class LoRaNode:
 
                         packet_type = packet_info.get('type', 'UNKNOWN')
                         
-                        # Handle SYSTEM packets (boot announcement)
                         if packet_type == 'SYSTEM':
                             self.log_and_print(f"RX: SYSTEM packet Seq#{seq_num} - Transmitter boot announcement")
                             compact_ts = packet_info.get('t', '')
@@ -774,11 +711,9 @@ class LoRaNode:
                                     pass
                             continue
 
-                        # Handle STORM_DATA packets
                         if 'd' in packet_info and 'r' in packet_info:
                             self.log_and_print(f"RX: STORM_DATA packet Seq#{seq_num}")
 
-                            # Reconstruct date/time for logging from compact format
                             compact_ts = packet_info.get('t', '')
                             csv_date, csv_time = "", ""
                             if compact_ts:
@@ -795,13 +730,11 @@ class LoRaNode:
 
                             self.update_stats('packets_received')
 
-                            # Send ACK
                             ack_packet = self.create_packet('ACK', seq_num, board_temp_c=self.get_cpu_temp())
                             self.log_and_print(f"RX: Sending ACK for Seq#{seq_num}")
                             self.send_packet(ack_packet)
                             self.update_stats('acks_sent')
 
-                            # Log to CSV
                             try:
                                 with open(self.csv_path, 'a') as csvfile:
                                     writer = csv.writer(csvfile)
@@ -821,7 +754,6 @@ class LoRaNode:
                             except Exception as e:
                                 self.log_and_print(f"RX: Failed to write to CSV: {e}")
 
-                        # Handle ACK packets (for transmitter thread)
                         elif packet_type == 'ACK':
                             self.log_and_print(f"RX: ACK received for Seq#{seq_num}")
                             if seq_num in self.pending_acks:
@@ -869,13 +801,10 @@ class LoRaNode:
         """Run the application based on mode"""
         try:
             if self.mode == 'tx':
-                # Start receiver thread for ACKs
                 rx_thread = threading.Thread(target=self.receiver_loop, daemon=True)
                 rx_thread.start()
-                # Run transmitter in main thread
                 self.transmitter_loop()
             else:
-                # Run receiver only
                 self.receiver_loop()
         except Exception as e:
             self.log_and_print(f"Fatal error: {e}")
@@ -890,7 +819,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Create and run application
     app = LoRaNode(
         mode=args.mode,
         addr=args.addr,
