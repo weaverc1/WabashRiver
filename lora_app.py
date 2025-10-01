@@ -674,23 +674,10 @@ class LoRaNode:
 
                 with self.ser_lock:
                     if self.node.ser.inWaiting() > 0:
-                        time.sleep(0.2)  # Allow full packet to arrive
-                        
+                        time.sleep(0.2)
                         bytes_available = self.node.ser.inWaiting()
                         if bytes_available > 0:
                             raw_data = self.node.ser.read(bytes_available)
-                            
-                            # Get RSSI immediately after reading packet
-                            packet_rssi = None
-                            noise_rssi = None
-                            snr = None
-                            try:
-                                packet_rssi = self.node.get_rssi()
-                                noise_rssi = self.get_noise_rssi()
-                                if packet_rssi is not None and noise_rssi is not None:
-                                    snr = packet_rssi - noise_rssi
-                            except:
-                                pass
                         else:
                             continue
                     else:
@@ -698,15 +685,41 @@ class LoRaNode:
                         continue
 
                 if len(raw_data) > 3:
+                    # Parse LoRa frame: [src_addr_h, src_addr_l, src_freq, payload..., rssi]
                     src_addr = (raw_data[0] << 8) | raw_data[1]
                     src_freq = raw_data[2]
-                    packet_data = raw_data[3:]
+                    
+                    # Extract RSSI from last byte (module configured with rssi=True)
+                    packet_data = raw_data[3:-1] if self.node.rssi else raw_data[3:]
+                    rssi_value = raw_data[-1] if self.node.rssi else None
 
-                    # Update stats if we got valid RSSI readings
-                    if packet_rssi is not None and noise_rssi is not None and snr is not None:
+                    # Calculate RSSI values
+                    packet_rssi = None
+                    noise_rssi = None
+                    snr = None
+
+                    if rssi_value is not None:
+                        packet_rssi = -(256 - rssi_value)
+                        
+                        # Validate RSSI is in reasonable range
+                        if packet_rssi < -120 or packet_rssi > -30:
+                            self.log_and_print(f"RX: Dropping packet with invalid RSSI: {packet_rssi}dBm")
+                            self.update_stats('invalid_packets')
+                            continue
+                        
                         self.update_stats('rssi_readings', packet_rssi)
-                        self.update_stats('snr_readings', snr)
-                        self.update_stats('noise_readings', noise_rssi)
+
+                        # Get noise floor with retry
+                        for attempt in range(3):
+                            noise_rssi = self.get_noise_rssi()
+                            if noise_rssi is not None and -120 <= noise_rssi <= -30:
+                                break
+                            time.sleep(0.05)
+
+                        if noise_rssi is not None and packet_rssi is not None:
+                            snr = packet_rssi - noise_rssi
+                            self.update_stats('snr_readings', snr)
+                            self.update_stats('noise_readings', noise_rssi)
 
                     freq_mhz = 850 + src_freq
                     self.log_and_print(f"RX: Received from addr {src_addr} at {freq_mhz}.125MHz")
