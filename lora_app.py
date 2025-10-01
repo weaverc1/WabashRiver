@@ -397,10 +397,12 @@ class LoRaNode:
         # Add checksum - the }} in f-string becomes single } in output
         packet_with_checksum = payload_json[:-1] + f',"c":"{checksum}"}}'
         
-        # DEBUG logging
-        self.log_and_print(f"DEBUG TX: len={len(packet_with_checksum)}, JSON={packet_with_checksum}")
+        # DEBUG logging - show both string and encoded bytes
+        packet_bytes = packet_with_checksum.encode('utf-8')
+        self.log_and_print(f"DEBUG TX STRING: len={len(packet_with_checksum)}, str={packet_with_checksum}")
+        self.log_and_print(f"DEBUG TX BYTES: len={len(packet_bytes)}, hex={packet_bytes.hex()}")
         
-        return packet_with_checksum.encode('utf-8')
+        return packet_bytes
 
     def verify_packet(self, packet_data):
         """Verify packet integrity using CRC-16/MODBUS checksum"""
