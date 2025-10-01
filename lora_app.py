@@ -604,26 +604,32 @@ class LoRaNode:
                 
                 self.log_and_print(f"TX Seq#{self.seq_number}: Sending Storm3 data packet")
                 
+                # CONSERVATIVE TRANSMISSION WITH RACE CONDITION FIX
                 success = False
                 retry_count = 0
-                max_retries = 3
+                max_retries = 5  # Increased from 3
                 
                 while retry_count < max_retries and not success:
                     if retry_count > 0:
                         self.log_and_print(f"TX Seq#{self.seq_number}: Retry {retry_count}/{max_retries-1}")
                     
+                    # FIX RACE CONDITION: Set up ACK waiting BEFORE sending packets
+                    self.ack_received.clear()
+                    self.pending_acks[self.seq_number] = retry_count
+                    
+                    # Now send packets with increased gap
+                    self.log_and_print(f"TX Seq#{self.seq_number}: Sending packet 1 of 2.")
                     send1_ok = self.send_packet(packet)
-                    time.sleep(0.3)
+                    time.sleep(0.5)  # Increased from 0.3
+                    self.log_and_print(f"TX Seq#{self.seq_number}: Sending packet 2 of 2.")
                     send2_ok = self.send_packet(packet)
                     
                     if send1_ok or send2_ok:
-                        self.log_and_print(f"TX Seq#{self.seq_number}: Packets sent, waiting for ACK...")
+                        self.log_and_print(f"TX Seq#{self.seq_number}: Packet sent (send1: {'OK' if send1_ok else 'FAIL'}, send2: {'OK' if send2_ok else 'FAIL'}), waiting for ACK...")
                         self.update_stats('packets_sent')
                         
-                        self.ack_received.clear()
-                        self.pending_acks[self.seq_number] = retry_count
-                        
-                        if self.ack_received.wait(timeout=15):
+                        # Wait longer for ACK (increased from 15s)
+                        if self.ack_received.wait(timeout=25):
                             if self.seq_number not in self.pending_acks:
                                 self.log_and_print(f"TX Seq#{self.seq_number}: ACK received")
                                 self.update_stats('acks_received')
@@ -634,15 +640,15 @@ class LoRaNode:
                     
                     retry_count += 1
                     if not success and retry_count < max_retries:
-                        time.sleep(3)
+                        time.sleep(8)  # Increased from 3
                 
                 if success:
-                    self.log_and_print(f"TX Seq#{self.seq_number}: Successfully transmitted")
+                    self.log_and_print(f"TX Seq#{self.seq_number}: Successfully transmitted and ACKed.")
                     if last_mod:
                         self.if_modified_since = last_mod
                     consecutive_failures = 0
                 else:
-                    self.log_and_print(f"TX Seq#{self.seq_number}: FAILED after {max_retries} attempts")
+                    self.log_and_print(f"TX Seq#{self.seq_number}: FAILED - No ACK after {max_retries} attempts")
                     self.pending_acks.pop(self.seq_number, None)
                     self.update_stats('failed_packets')
                     consecutive_failures += 1
@@ -771,6 +777,9 @@ class LoRaNode:
 
                             self.update_stats('packets_received')
 
+                            # CONSERVATIVE ACK: Add small delay before sending ACK
+                            time.sleep(0.2)
+                            
                             ack_packet = self.create_packet('ACK', seq_num, board_temp_c=self.get_cpu_temp())
                             self.log_and_print(f"RX: Sending ACK for Seq#{seq_num}")
                             self.send_packet(ack_packet)
@@ -800,6 +809,8 @@ class LoRaNode:
                             if seq_num in self.pending_acks:
                                 self.pending_acks.pop(seq_num)
                                 self.ack_received.set()
+                            else:
+                                self.log_and_print(f"RX: Unexpected ACK for Seq#{seq_num}")
                         else:
                             self.log_and_print(f"RX: Unknown packet type: {packet_type}")
                     else:
