@@ -396,16 +396,16 @@ class LoRaNode:
             compact_ts = ""
         
         payload = {
-            'type': packet_type,   # Use 'type' instead of 't' for clarity
-            's': seq_num,          # sequence
-            'T': kwargs.get('board_temp_c', 0.0),  # Temperature
+            'type': packet_type,   
+            's': seq_num,          
+            'T': kwargs.get('board_temp_c', 0.0),
         }
         
         if packet_type == 'STORM_DATA':
             payload.update({
-                't': compact_ts,                    # timestamp (compact)
-                'd': kwargs.get('riverstage', ''),  # data (river)
-                'r': kwargs.get('rain_gauge', '')   # rain
+                't': compact_ts,                    
+                'd': kwargs.get('riverstage', ''),  
+                'r': kwargs.get('rain_gauge', '')   
             })
         
         # Serialize to JSON
@@ -415,8 +415,8 @@ class LoRaNode:
         # Calculate checksum
         checksum = crc16_modbus(payload_bytes)
         
-        # Append checksum to JSON
-        packet_with_checksum = payload_json[:-1] + f',"c":"{checksum}"}}'
+        # Append checksum - FIX: Only add ONE closing brace
+        packet_with_checksum = payload_json[:-1] + f',"c":"{checksum}"}' # REMOVED EXTRA }
         
         return packet_with_checksum.encode('utf-8')
 
