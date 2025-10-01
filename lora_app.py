@@ -407,11 +407,21 @@ class LoRaNode:
     def verify_packet(self, packet_data):
         """Verify packet integrity using CRC-16/MODBUS checksum"""
         try:
-            packet_str = packet_data.decode('utf-8', errors='replace')
+            # Strip any trailing null bytes or garbage
+            # Find the last '}' which should be the end of our JSON
+            last_brace = packet_data.rfind(b'}')
+            if last_brace == -1:
+                self.log_and_print("RX: No closing brace found in packet")
+                return False, None
+            
+            # Trim to just the JSON part
+            packet_data = packet_data[:last_brace + 1]
+            
+            packet_str = packet_data.decode('utf-8', errors='strict')
             
             # DEBUG logging
-            self.log_and_print(f"DEBUG RX: len={len(packet_str)}, JSON={packet_str}")
-            self.log_and_print(f"DEBUG RX: bytes={packet_str.encode('utf-8').hex()}")
+            self.log_and_print(f"DEBUG RX: trimmed len={len(packet_str)}, JSON={packet_str}")
+            self.log_and_print(f"DEBUG RX: trimmed bytes={packet_str.encode('utf-8').hex()}")
             
             packet_info = json.loads(packet_str)
             
